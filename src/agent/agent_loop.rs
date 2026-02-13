@@ -68,6 +68,9 @@ pub struct AgentDeps {
     pub extension_manager: Option<Arc<ExtensionManager>>,
     pub skill_registry: Option<Arc<SkillRegistry>>,
     pub skills_config: SkillsConfig,
+    /// Handle to update skill permissions on the CreateJobTool (for worker enforcement).
+    pub job_skill_permissions:
+        Option<Arc<tokio::sync::RwLock<Vec<crate::skills::enforcer::SerializedToolPermission>>>>,
 }
 
 /// The main agent that coordinates all components.
@@ -1041,31 +1044,27 @@ impl Agent {
         let active_skills: Vec<crate::skills::LoadedSkill> =
             if let Some(registry) = self.skill_registry() {
                 let available = registry.available().await;
-                if !available.is_empty() {
-                    let skills_cfg = &self.deps.skills_config;
-                    let selected = crate::skills::prefilter_skills(
-                        &message.content,
-                        &available,
-                        skills_cfg.max_active_skills,
-                        skills_cfg.max_context_tokens,
+                let skills_cfg = &self.deps.skills_config;
+                let selected = crate::skills::prefilter_skills(
+                    &message.content,
+                    &available,
+                    skills_cfg.max_active_skills,
+                    skills_cfg.max_context_tokens,
+                );
+
+                if !selected.is_empty() {
+                    tracing::debug!(
+                        "Selected {} skill(s) for message: {}",
+                        selected.len(),
+                        selected
+                            .iter()
+                            .map(|s| s.name())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
-
-                    if !selected.is_empty() {
-                        tracing::debug!(
-                            "Selected {} skill(s) for message: {}",
-                            selected.len(),
-                            selected
-                                .iter()
-                                .map(|s| s.name())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
-                    }
-
-                    selected.into_iter().cloned().collect()
-                } else {
-                    vec![]
                 }
+
+                selected.into_iter().cloned().collect()
             } else {
                 vec![]
             };
@@ -1078,6 +1077,32 @@ impl Agent {
         } else {
             None
         };
+
+        // Build permission enforcer for active skills (parameter-level enforcement)
+        let skill_permission_enforcer = if !active_skills.is_empty() {
+            let enforcer =
+                crate::skills::SkillPermissionEnforcer::from_active_skills(&active_skills);
+            if enforcer.has_enforcement() {
+                Some(enforcer)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Update skill permissions on the CreateJobTool so spawned workers
+        // inherit the current session's skill context.
+        if let Some(ref handle) = self.deps.job_skill_permissions {
+            let serialized = if !active_skills.is_empty() {
+                crate::skills::enforcer::SerializedToolPermission::from_active_skills(
+                    &active_skills,
+                )
+            } else {
+                vec![]
+            };
+            *handle.write().await = serialized;
+        }
 
         // Build skill context block and compute trust attenuation
         let (skill_context, skill_trust) = if !active_skills.is_empty() {
@@ -1219,9 +1244,16 @@ impl Agent {
                     m
                 });
 
-            let result = reasoning.respond_with_tools(&context).await?;
+            let output = reasoning.respond_with_tools(&context).await?;
 
-            match result {
+            // Track token usage for budget enforcement
+            tracing::debug!(
+                "LLM call used {} input + {} output tokens",
+                output.usage.input_tokens,
+                output.usage.output_tokens
+            );
+
+            match output.result {
                 RespondResult::Text(text) => {
                     // If no tools have been executed yet, prompt the LLM to use tools
                     // This handles the case where the model explains what it will do
@@ -1285,10 +1317,37 @@ impl Agent {
                         if let Some(tool) = self.tools().get(&tc.name).await {
                             if tool.requires_approval() {
                                 // Check if auto-approved for this session
-                                let is_auto_approved = {
+                                let mut is_auto_approved = {
                                     let sess = session.lock().await;
                                     sess.is_tool_auto_approved(&tc.name)
                                 };
+
+                                // For shell commands, override auto-approval for
+                                // destructive patterns that should always require
+                                // explicit per-invocation approval.
+                                if is_auto_approved && tc.name == "shell" {
+                                    if let Some(cmd) = tc
+                                        .arguments
+                                        .as_str()
+                                        .and_then(|s| {
+                                            serde_json::from_str::<serde_json::Value>(s).ok()
+                                        })
+                                        .and_then(|v| {
+                                            v.get("command")
+                                                .and_then(|c| c.as_str().map(String::from))
+                                        })
+                                    {
+                                        if crate::tools::builtin::shell::requires_explicit_approval(
+                                            &cmd,
+                                        ) {
+                                            tracing::info!(
+                                                "Shell command '{}' requires explicit approval despite auto-approve",
+                                                cmd.chars().take(80).collect::<String>()
+                                            );
+                                            is_auto_approved = false;
+                                        }
+                                    }
+                                }
 
                                 if !is_auto_approved {
                                     // Need approval - store pending request and return
@@ -1323,6 +1382,7 @@ impl Agent {
                                 &tc.arguments,
                                 &job_ctx,
                                 skill_http_scopes.as_ref(),
+                                skill_permission_enforcer.as_ref(),
                             )
                             .await;
 
@@ -1433,6 +1493,7 @@ impl Agent {
         params: &serde_json::Value,
         job_ctx: &JobContext,
         http_scopes: Option<&crate::skills::SkillHttpScopes>,
+        permission_enforcer: Option<&crate::skills::SkillPermissionEnforcer>,
     ) -> Result<String, Error> {
         let tool =
             self.tools()
@@ -1484,6 +1545,18 @@ impl Agent {
                     })?;
                 }
             }
+        }
+
+        // Enforce skill permission patterns (parameter-level enforcement)
+        if let Some(enforcer) = permission_enforcer {
+            enforcer.validate_tool_call(tool_name, params).map_err(
+                |e: crate::skills::enforcer::PermissionError| {
+                    crate::error::ToolError::ExecutionFailed {
+                        name: tool_name.to_string(),
+                        reason: e.to_string(),
+                    }
+                },
+            )?;
         }
 
         tracing::debug!(
@@ -1826,11 +1899,13 @@ impl Agent {
                 .await;
 
             // User explicitly approved this tool call, so skip HTTP scoping
+            // and permission enforcement
             let tool_result = self
                 .execute_chat_tool(
                     &pending.tool_name,
                     &pending.parameters,
                     &job_ctx,
+                    None,
                     None,
                 )
                 .await;

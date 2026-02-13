@@ -210,12 +210,15 @@ async fn main() -> anyhow::Result<()> {
                 model
             );
 
+            // Load allowed tools from config (env var or defaults).
+            let claude_config = ironclaw::config::ClaudeCodeConfig::from_env();
             let config = ironclaw::worker::claude_bridge::ClaudeBridgeConfig {
                 job_id: *job_id,
                 orchestrator_url: orchestrator_url.clone(),
                 max_turns: *max_turns,
                 model: model.clone(),
                 timeout: std::time::Duration::from_secs(1800),
+                allowed_tools: claude_config.allowed_tools,
             };
 
             let runtime = ironclaw::worker::ClaudeBridgeRuntime::new(config)
@@ -681,6 +684,7 @@ async fn main() -> anyhow::Result<()> {
             claude_code_model: config.claude_code.model.clone(),
             claude_code_max_turns: config.claude_code.max_turns,
             claude_code_memory_limit_mb: config.claude_code.memory_limit_mb,
+            claude_code_allowed_tools: config.claude_code.allowed_tools.clone(),
         };
         let jm = Arc::new(ContainerJobManager::new(job_config, token_store.clone()));
 
@@ -969,7 +973,7 @@ async fn main() -> anyhow::Result<()> {
     let session_manager = Arc::new(SessionManager::new());
 
     // Register job tools (sandbox deps auto-injected when container_job_manager is available)
-    tools.register_job_tools(
+    let job_skill_permissions_handle = tools.register_job_tools(
         Arc::clone(&context_manager),
         container_job_manager.clone(),
         store.clone(),
@@ -993,6 +997,7 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref jm) = container_job_manager {
             gw = gw.with_job_manager(Arc::clone(jm));
         }
+        gw = gw.with_llm_provider(Arc::clone(&llm));
         if config.sandbox.enabled {
             gw = gw.with_prompt_queue(Arc::clone(&prompt_queue));
 
@@ -1025,7 +1030,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize skills system
     let skill_registry = if config.skills.enabled {
-        let registry = ironclaw::skills::SkillRegistry::new(config.skills.local_dir.clone());
+        let mut registry = ironclaw::skills::SkillRegistry::new(config.skills.local_dir.clone());
+        // Wire LLM behavioral analyzer for non-local skill analysis
+        let analyzer = Arc::new(ironclaw::skills::BehavioralAnalyzer::new(Arc::clone(&llm)));
+        registry = registry.with_behavioral_analyzer(analyzer);
         let loaded = registry.discover_local().await;
         if !loaded.is_empty() {
             tracing::info!(
@@ -1049,6 +1057,7 @@ async fn main() -> anyhow::Result<()> {
         extension_manager,
         skill_registry,
         skills_config: config.skills.clone(),
+        job_skill_permissions: job_skill_permissions_handle,
     };
     let agent = Agent::new(
         config.agent.clone(),

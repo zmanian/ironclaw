@@ -58,6 +58,8 @@ pub struct ContainerJobConfig {
     pub claude_code_max_turns: u32,
     /// Memory limit in MB for Claude Code containers (heavier than workers).
     pub claude_code_memory_limit_mb: u64,
+    /// Allowed tool patterns for Claude Code (passed as CLAUDE_CODE_ALLOWED_TOOLS env var).
+    pub claude_code_allowed_tools: Vec<String>,
 }
 
 impl Default for ContainerJobConfig {
@@ -71,6 +73,7 @@ impl Default for ContainerJobConfig {
             claude_code_model: "sonnet".to_string(),
             claude_code_max_turns: 50,
             claude_code_memory_limit_mb: 4096,
+            claude_code_allowed_tools: crate::config::ClaudeCodeConfig::default().allowed_tools,
         }
     }
 }
@@ -107,6 +110,8 @@ pub struct ContainerHandle {
     pub task_description: String,
     /// Completion result from the worker (set when the worker reports done).
     pub completion_result: Option<CompletionResult>,
+    /// Skill permissions frozen at job creation time for worker enforcement.
+    pub skill_permissions: Vec<crate::skills::enforcer::SerializedToolPermission>,
     // NOTE: auth_token is intentionally NOT in this struct.
     // It lives only in the TokenStore (never logged, serialized, or persisted).
 }
@@ -138,12 +143,30 @@ impl ContainerJobManager {
     ///
     /// The caller provides the `job_id` so it can be persisted to the database
     /// before the container is created. Returns the auth token for the worker.
+    ///
+    /// Note: this convenience wrapper passes empty skill permissions to the worker.
+    /// Callers that need permission enforcement (e.g. `CreateJobTool`) should use
+    /// `create_job_with_permissions()` instead. The web gateway's job-restart
+    /// handler uses this method, so restarted jobs run without skill enforcement.
     pub async fn create_job(
         &self,
         job_id: Uuid,
         task: &str,
         project_dir: Option<PathBuf>,
         mode: JobMode,
+    ) -> Result<String, OrchestratorError> {
+        self.create_job_with_permissions(job_id, task, project_dir, mode, vec![])
+            .await
+    }
+
+    /// Create and start a new container for a job with skill permissions.
+    pub async fn create_job_with_permissions(
+        &self,
+        job_id: Uuid,
+        task: &str,
+        project_dir: Option<PathBuf>,
+        mode: JobMode,
+        skill_permissions: Vec<crate::skills::enforcer::SerializedToolPermission>,
     ) -> Result<String, OrchestratorError> {
         // Generate auth token (stored in TokenStore, never logged)
         let token = self.token_store.create_token(job_id).await;
@@ -158,9 +181,33 @@ impl ContainerJobManager {
             project_dir: project_dir.clone(),
             task_description: task.to_string(),
             completion_result: None,
+            skill_permissions,
         };
         self.containers.write().await.insert(job_id, handle);
 
+        // Run the actual container creation. On any failure, revoke the token
+        // and remove the handle so we don't leak resources.
+        match self
+            .create_job_inner(job_id, &token, project_dir, mode)
+            .await
+        {
+            Ok(()) => Ok(token),
+            Err(e) => {
+                self.token_store.revoke(job_id).await;
+                self.containers.write().await.remove(&job_id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Inner implementation of container creation (separated for cleanup).
+    async fn create_job_inner(
+        &self,
+        job_id: Uuid,
+        token: &str,
+        project_dir: Option<PathBuf>,
+        mode: JobMode,
+    ) -> Result<(), OrchestratorError> {
         // Connect to Docker
         let docker = connect_docker()
             .await
@@ -219,10 +266,17 @@ impl ContainerJobManager {
             env_vec.push("IRONCLAW_WORKSPACE=/workspace".to_string());
         }
 
-        // Claude Code mode: mount host ~/.claude read-only for auth
+        // Claude Code mode: mount host ~/.claude read-only for auth,
+        // and pass the tool allowlist so the bridge can write settings.json.
         if mode == JobMode::ClaudeCode {
             if let Some(ref claude_dir) = self.config.claude_config_dir {
                 binds.push(format!("{}:/home/sandbox/.claude:ro", claude_dir.display()));
+            }
+            if !self.config.claude_code_allowed_tools.is_empty() {
+                env_vec.push(format!(
+                    "CLAUDE_CODE_ALLOWED_TOOLS={}",
+                    self.config.claude_code_allowed_tools.join(",")
+                ));
             }
         }
 
@@ -243,11 +297,7 @@ impl ContainerJobManager {
             network_mode: Some("bridge".to_string()),
             extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
             cap_drop: Some(vec!["ALL".to_string()]),
-            cap_add: Some(vec![
-                "CHOWN".to_string(),
-                "SETUID".to_string(),
-                "SETGID".to_string(),
-            ]),
+            cap_add: Some(vec!["CHOWN".to_string()]),
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
             tmpfs: Some(
                 [("/tmp".to_string(), "size=512M".to_string())]
@@ -328,7 +378,7 @@ impl ContainerJobManager {
             "Created and started worker container"
         );
 
-        Ok(token)
+        Ok(())
     }
 
     /// Stop a running container job.
@@ -355,15 +405,18 @@ impl ContainerJobManager {
             })?;
 
         // Stop the container (10 second grace period)
-        let _ = docker
+        if let Err(e) = docker
             .stop_container(
                 &container_id,
                 Some(bollard::container::StopContainerOptions { t: 10 }),
             )
-            .await;
+            .await
+        {
+            tracing::warn!(job_id = %job_id, error = %e, "Failed to stop container (may already be stopped)");
+        }
 
         // Remove the container
-        let _ = docker
+        if let Err(e) = docker
             .remove_container(
                 &container_id,
                 Some(bollard::container::RemoveContainerOptions {
@@ -371,7 +424,10 @@ impl ContainerJobManager {
                     ..Default::default()
                 }),
             )
-            .await;
+            .await
+        {
+            tracing::warn!(job_id = %job_id, error = %e, "Failed to remove container (may require manual cleanup)");
+        }
 
         // Update state
         if let Some(handle) = self.containers.write().await.get_mut(&job_id) {
@@ -409,22 +465,33 @@ impl ContainerJobManager {
         };
         if let Some(cid) = container_id {
             if !cid.is_empty() {
-                if let Ok(docker) = connect_docker().await {
-                    let _ = docker
-                        .stop_container(
-                            &cid,
-                            Some(bollard::container::StopContainerOptions { t: 5 }),
-                        )
-                        .await;
-                    let _ = docker
-                        .remove_container(
-                            &cid,
-                            Some(bollard::container::RemoveContainerOptions {
-                                force: true,
-                                ..Default::default()
-                            }),
-                        )
-                        .await;
+                match connect_docker().await {
+                    Ok(docker) => {
+                        if let Err(e) = docker
+                            .stop_container(
+                                &cid,
+                                Some(bollard::container::StopContainerOptions { t: 5 }),
+                            )
+                            .await
+                        {
+                            tracing::warn!(job_id = %job_id, error = %e, "Failed to stop completed container");
+                        }
+                        if let Err(e) = docker
+                            .remove_container(
+                                &cid,
+                                Some(bollard::container::RemoveContainerOptions {
+                                    force: true,
+                                    ..Default::default()
+                                }),
+                            )
+                            .await
+                        {
+                            tracing::warn!(job_id = %job_id, error = %e, "Failed to remove completed container");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(job_id = %job_id, error = %e, "Failed to connect to Docker for container cleanup");
+                    }
                 }
             }
         }
