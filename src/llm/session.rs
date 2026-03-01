@@ -7,6 +7,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::bootstrap::ironclaw_base_dir;
+use crate::cli::oauth_defaults::OAUTH_CALLBACK_PORT;
+
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use secrecy::SecretString;
@@ -31,8 +34,6 @@ pub struct SessionConfig {
     pub auth_base_url: String,
     /// Path to session file (e.g., ~/.ironclaw/session.json).
     pub session_path: PathBuf,
-    /// Port range for OAuth callback server.
-    pub callback_port_range: (u16, u16),
 }
 
 impl Default for SessionConfig {
@@ -40,17 +41,13 @@ impl Default for SessionConfig {
         Self {
             auth_base_url: "https://private.near.ai".to_string(),
             session_path: default_session_path(),
-            callback_port_range: (9876, 9886),
         }
     }
 }
 
 /// Get the default session file path (~/.ironclaw/session.json).
 pub fn default_session_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ironclaw")
-        .join("session.json")
+    ironclaw_base_dir().join("session.json")
 }
 
 /// Manages NEAR AI session tokens with persistence and automatic renewal.
@@ -62,7 +59,7 @@ pub struct SessionManager {
     /// Prevents thundering herd during concurrent 401s.
     renewal_lock: Mutex<()>,
     /// Optional database store for persisting session to the settings table.
-    store: RwLock<Option<Arc<crate::history::Store>>>,
+    store: RwLock<Option<Arc<dyn crate::db::Database>>>,
     /// User ID for DB settings (default: "default").
     user_id: RwLock<String>,
 }
@@ -83,16 +80,16 @@ impl SessionManager {
         };
 
         // Try to load existing session synchronously during construction
-        if let Ok(data) = std::fs::read_to_string(&manager.config.session_path) {
-            if let Ok(session) = serde_json::from_str::<SessionData>(&data) {
-                // We can't await here, so we use try_write
-                if let Ok(mut guard) = manager.token.try_write() {
-                    *guard = Some(SecretString::from(session.session_token));
-                    tracing::info!(
-                        "Loaded session token from {}",
-                        manager.config.session_path.display()
-                    );
-                }
+        if let Ok(data) = std::fs::read_to_string(&manager.config.session_path)
+            && let Ok(session) = serde_json::from_str::<SessionData>(&data)
+        {
+            // We can't await here, so we use try_write
+            if let Ok(mut guard) = manager.token.try_write() {
+                *guard = Some(SecretString::from(session.session_token));
+                tracing::info!(
+                    "Loaded session token from {}",
+                    manager.config.session_path.display()
+                );
             }
         }
 
@@ -125,7 +122,7 @@ impl SessionManager {
     /// When a store is attached, session tokens are saved to the `settings`
     /// table (key: `nearai.session_token`) in addition to the disk file.
     /// On load, DB is preferred over disk.
-    pub async fn attach_store(&self, store: Arc<crate::history::Store>, user_id: &str) {
+    pub async fn attach_store(&self, store: Arc<dyn crate::db::Database>, user_id: &str) {
         *self.store.write().await = Some(store);
         *self.user_id.write().await = user_id.to_string();
 
@@ -160,14 +157,14 @@ impl SessionManager {
         }
 
         // Token exists, validate it by calling /v1/users/me
-        println!("Validating session...");
+        tracing::debug!("Validating session...");
         match self.validate_token().await {
             Ok(()) => {
-                println!("Session valid.");
+                tracing::debug!("Session valid");
                 Ok(())
             }
             Err(e) => {
-                println!("Session expired or invalid: {}", e);
+                tracing::info!("Session expired or invalid: {}", e);
                 self.initiate_login().await
             }
         }
@@ -220,55 +217,44 @@ impl SessionManager {
         self.initiate_login().await
     }
 
-    /// Start the OAuth login flow.
+    /// Start the login flow.
     ///
-    /// 1. Find an available port for the callback server
+    /// Shows the auth method menu FIRST (before binding any listener), so
+    /// that the API-key path can skip network binding entirely. This is
+    /// important for remote/headless servers where `127.0.0.1` is
+    /// unreachable from the user's browser.
+    ///
+    /// For OAuth paths (GitHub, Google):
+    /// 1. Bind the callback listener
     /// 2. Print the auth URL and attempt to open browser
     /// 3. Wait for OAuth callback with session token
     /// 4. Save and return the token
+    ///
+    /// For NEAR AI Cloud API key:
+    /// 1. Prompt user for API key from cloud.near.ai
+    /// 2. Set NEARAI_API_KEY env var and save to bootstrap .env
+    /// 3. No session token saved (different auth model)
     async fn initiate_login(&self) -> Result<(), LlmError> {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::TcpListener;
+        use crate::cli::oauth_defaults;
 
-        // Find an available port
-        let mut listener = None;
-        let mut port = 0;
+        let cb_url = oauth_defaults::callback_url();
+        let host = oauth_defaults::callback_host();
 
-        for p in self.config.callback_port_range.0..=self.config.callback_port_range.1 {
-            match TcpListener::bind(format!("127.0.0.1:{}", p)).await {
-                Ok(l) => {
-                    listener = Some(l);
-                    port = p;
-                    break;
-                }
-                Err(_) => continue,
-            }
-        }
-
-        let listener = listener.ok_or_else(|| LlmError::SessionRenewalFailed {
-            provider: "nearai".to_string(),
-            reason: format!(
-                "Could not find available port in range {}-{}",
-                self.config.callback_port_range.0, self.config.callback_port_range.1
-            ),
-        })?;
-
-        let callback_url = format!("http://127.0.0.1:{}", port);
-
-        // Show auth provider menu
+        // Show auth provider menu BEFORE binding the listener
         println!();
         println!("╔════════════════════════════════════════════════════════════════╗");
         println!("║                    NEAR AI Authentication                      ║");
         println!("╠════════════════════════════════════════════════════════════════╣");
         println!("║  Choose an authentication method:                              ║");
         println!("║                                                                ║");
-        println!("║    [1] GitHub                                                  ║");
-        println!("║    [2] Google                                                  ║");
+        println!("║    [1] GitHub            (requires localhost browser access)   ║");
+        println!("║    [2] Google            (requires localhost browser access)   ║");
         println!("║    [3] NEAR Wallet (coming soon)                               ║");
+        println!("║    [4] NEAR AI Cloud API key                                   ║");
         println!("║                                                                ║");
         println!("╚════════════════════════════════════════════════════════════════╝");
         println!();
-        print!("Enter choice [1-3]: ");
+        print!("Enter choice [1-4]: ");
 
         // Flush stdout to ensure prompt is displayed
         use std::io::Write;
@@ -283,23 +269,8 @@ impl SessionManager {
                 reason: format!("Failed to read input: {}", e),
             })?;
 
-        let (auth_provider, auth_url) = match choice.trim() {
-            "1" | "" => {
-                let url = format!(
-                    "{}/v1/auth/github?frontend_callback={}",
-                    self.config.auth_base_url,
-                    urlencoding::encode(&callback_url)
-                );
-                ("github", url)
-            }
-            "2" => {
-                let url = format!(
-                    "{}/v1/auth/google?frontend_callback={}",
-                    self.config.auth_base_url,
-                    urlencoding::encode(&callback_url)
-                );
-                ("google", url)
-            }
+        match choice.trim() {
+            "4" => return self.api_key_login().await,
             "3" => {
                 println!();
                 println!("NEAR Wallet authentication is not yet implemented.");
@@ -309,11 +280,52 @@ impl SessionManager {
                     reason: "NEAR Wallet auth not yet implemented".to_string(),
                 });
             }
-            _ => {
+            "1" | "" | "2" => {} // handled below after listener bind
+            other => {
                 return Err(LlmError::SessionRenewalFailed {
                     provider: "nearai".to_string(),
-                    reason: format!("Invalid choice: {}", choice.trim()),
+                    reason: format!("Invalid choice: {}", other),
                 });
+            }
+        }
+
+        // Warn about plain-HTTP token transmission only for OAuth paths (1, 2)
+        // where the callback URL actually carries the session token.
+        if !oauth_defaults::is_loopback_host(&host) {
+            println!();
+            println!("Warning: OAuth callback is using plain HTTP to a remote host ({host}).");
+            println!("         The session token will be transmitted unencrypted.");
+            println!("         Consider SSH port forwarding instead:");
+            println!(
+                "           ssh -L {OAUTH_CALLBACK_PORT}:127.0.0.1:{OAUTH_CALLBACK_PORT} user@{host}"
+            );
+        }
+
+        // OAuth paths: bind the callback listener now
+        let listener = oauth_defaults::bind_callback_listener()
+            .await
+            .map_err(|e| LlmError::SessionRenewalFailed {
+                provider: "nearai".to_string(),
+                reason: e.to_string(),
+            })?;
+
+        let (auth_provider, auth_url) = match choice.trim() {
+            "2" => {
+                let url = format!(
+                    "{}/v1/auth/google?frontend_callback={}",
+                    self.config.auth_base_url,
+                    urlencoding::encode(&cb_url)
+                );
+                ("google", url)
+            }
+            _ => {
+                // "1" or "" (default)
+                let url = format!(
+                    "{}/v1/auth/github?frontend_callback={}",
+                    self.config.auth_base_url,
+                    urlencoding::encode(&cb_url)
+                );
+                ("github", url)
             }
         };
 
@@ -333,138 +345,16 @@ impl SessionManager {
         println!();
         println!("Waiting for authentication...");
 
-        // Wait for callback with timeout
-        // The API redirects to: {frontend_callback}/auth/callback?token=X&session_id=X&expires_at=X&is_new_user=X
-        let timeout = std::time::Duration::from_secs(300); // 5 minutes
-        let selected_provider = auth_provider.to_string();
-        let (session_token, auth_provider) = tokio::time::timeout(timeout, async move {
-            loop {
-                let (mut socket, _) = listener.accept().await.map_err(|e| {
-                    LlmError::SessionRenewalFailed {
-                        provider: "nearai".to_string(),
-                        reason: format!("Failed to accept connection: {}", e),
-                    }
+        // The NEAR AI API redirects to: {frontend_callback}/auth/callback?token=X&...
+        let session_token =
+            oauth_defaults::wait_for_callback(listener, "/auth/callback", "token", "NEAR AI")
+                .await
+                .map_err(|e| LlmError::SessionRenewalFailed {
+                    provider: "nearai".to_string(),
+                    reason: e.to_string(),
                 })?;
 
-                let mut reader = BufReader::new(&mut socket);
-                let mut request_line = String::new();
-                reader.read_line(&mut request_line).await.map_err(|e| {
-                    LlmError::SessionRenewalFailed {
-                        provider: "nearai".to_string(),
-                        reason: format!("Failed to read request: {}", e),
-                    }
-                })?;
-
-                // Parse GET /auth/callback?token=xxx&session_id=xxx&expires_at=xxx&is_new_user=xxx HTTP/1.1
-                if let Some(path) = request_line.split_whitespace().nth(1) {
-                    if path.starts_with("/auth/callback") {
-                        // Parse query parameters
-                        if let Some(query) = path.split('?').nth(1) {
-                            let mut token = None;
-
-                            for param in query.split('&') {
-                                let parts: Vec<&str> = param.splitn(2, '=').collect();
-                                if parts.len() == 2 && parts[0] == "token" {
-                                    token = Some(
-                                        urlencoding::decode(parts[1])
-                                            .unwrap_or_else(|_| parts[1].into())
-                                            .into_owned(),
-                                    );
-                                }
-                            }
-
-                            if let Some(token) = token {
-                                // Send success response with nice styling
-                                let response = concat!(
-                                    "HTTP/1.1 200 OK\r\n",
-                                    "Content-Type: text/html; charset=utf-8\r\n",
-                                    "Connection: close\r\n",
-                                    "\r\n",
-                                    "<!DOCTYPE html>\n",
-                                    "<html>\n",
-                                    "<head>\n",
-                                    "  <meta charset=\"utf-8\">\n",
-                                    "  <title>NEAR AI - Authentication Successful</title>\n",
-                                    "  <style>\n",
-                                    "    * { margin: 0; padding: 0; box-sizing: border-box; }\n",
-                                    "    body {\n",
-                                    "      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;\n",
-                                    "      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);\n",
-                                    "      min-height: 100vh;\n",
-                                    "      display: flex;\n",
-                                    "      align-items: center;\n",
-                                    "      justify-content: center;\n",
-                                    "      color: #fff;\n",
-                                    "    }\n",
-                                    "    .container {\n",
-                                    "      text-align: center;\n",
-                                    "      padding: 3rem;\n",
-                                    "      background: rgba(255,255,255,0.05);\n",
-                                    "      border-radius: 16px;\n",
-                                    "      backdrop-filter: blur(10px);\n",
-                                    "      border: 1px solid rgba(255,255,255,0.1);\n",
-                                    "      max-width: 400px;\n",
-                                    "    }\n",
-                                    "    .checkmark {\n",
-                                    "      width: 80px;\n",
-                                    "      height: 80px;\n",
-                                    "      background: linear-gradient(135deg, #00d9a5 0%, #00b386 100%);\n",
-                                    "      border-radius: 50%;\n",
-                                    "      display: flex;\n",
-                                    "      align-items: center;\n",
-                                    "      justify-content: center;\n",
-                                    "      margin: 0 auto 1.5rem;\n",
-                                    "      font-size: 40px;\n",
-                                    "    }\n",
-                                    "    h1 {\n",
-                                    "      font-size: 1.5rem;\n",
-                                    "      font-weight: 600;\n",
-                                    "      margin-bottom: 0.75rem;\n",
-                                    "    }\n",
-                                    "    p {\n",
-                                    "      color: rgba(255,255,255,0.7);\n",
-                                    "      font-size: 0.95rem;\n",
-                                    "      line-height: 1.5;\n",
-                                    "    }\n",
-                                    "    .brand {\n",
-                                    "      margin-top: 2rem;\n",
-                                    "      padding-top: 1.5rem;\n",
-                                    "      border-top: 1px solid rgba(255,255,255,0.1);\n",
-                                    "      font-size: 0.8rem;\n",
-                                    "      color: rgba(255,255,255,0.4);\n",
-                                    "    }\n",
-                                    "  </style>\n",
-                                    "</head>\n",
-                                    "<body>\n",
-                                    "  <div class=\"container\">\n",
-                                    "    <div class=\"checkmark\">&#10003;</div>\n",
-                                    "    <h1>Authentication Successful</h1>\n",
-                                    "    <p>You can close this window and return to the terminal.</p>\n",
-                                    "    <div class=\"brand\">NEAR AI Agent</div>\n",
-                                    "  </div>\n",
-                                    "</body>\n",
-                                    "</html>"
-                                );
-
-                                let _ = socket.write_all(response.as_bytes()).await;
-                                let _ = socket.shutdown().await;
-
-                                return Ok::<_, LlmError>((token, Some(selected_provider.clone())));
-                            }
-                        }
-                    }
-                }
-
-                // Not the callback we're looking for, send 404
-                let response = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
-                let _ = socket.write_all(response.as_bytes()).await;
-            }
-        })
-        .await
-        .map_err(|_| LlmError::SessionRenewalFailed {
-            provider: "nearai".to_string(),
-            reason: "Authentication timed out after 5 minutes".to_string(),
-        })??;
+        let auth_provider = Some(auth_provider.to_string());
 
         // Save the token
         self.save_session(&session_token, auth_provider.as_deref())
@@ -478,6 +368,63 @@ impl SessionManager {
 
         println!();
         println!("✓ Authentication successful!");
+        println!();
+
+        Ok(())
+    }
+
+    /// NEAR AI Cloud API key entry flow.
+    ///
+    /// Prompts the user to enter a NEAR AI Cloud API key from
+    /// cloud.near.ai. The key is set as `NEARAI_API_KEY` env var so
+    /// `LlmConfig::resolve()` auto-selects ChatCompletions mode, and
+    /// saved to `~/.ironclaw/.env` for persistence across restarts.
+    /// No session token is saved and no `/v1/users/me` validation is
+    /// performed (different auth model).
+    async fn api_key_login(&self) -> Result<(), LlmError> {
+        println!();
+        println!("NEAR AI Cloud API key");
+        println!("─────────────────────");
+        println!();
+        println!("  1. Open https://cloud.near.ai in your browser");
+        println!("  2. Sign in and navigate to API Keys");
+        println!("  3. Create or copy an existing API key");
+        println!();
+
+        let key_secret =
+            crate::setup::secret_input("API key").map_err(|e| LlmError::SessionRenewalFailed {
+                provider: "nearai".to_string(),
+                reason: format!("Failed to read input: {}", e),
+            })?;
+
+        use secrecy::ExposeSecret;
+        let key = key_secret.expose_secret().to_string();
+        if key.is_empty() {
+            return Err(LlmError::SessionRenewalFailed {
+                provider: "nearai".to_string(),
+                reason: "API key cannot be empty".to_string(),
+            });
+        }
+
+        // Set env var so Config picks it up immediately
+        // (LlmConfig::resolve() auto-selects ChatCompletions mode when
+        // NEARAI_API_KEY is present).
+        //
+        // SAFETY: called during single-threaded interactive login flow.
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var("NEARAI_API_KEY", &key);
+        }
+
+        // Persist to ~/.ironclaw/.env so the key survives restarts
+        // (bootstrap layer — available before DB is connected).
+        // Uses upsert to avoid clobbering existing bootstrap vars.
+        if let Err(e) = crate::bootstrap::upsert_bootstrap_var("NEARAI_API_KEY", &key) {
+            tracing::warn!("Failed to save API key to bootstrap .env: {}", e);
+        }
+
+        println!();
+        crate::setup::print_success("NEAR AI Cloud API key saved.");
         println!();
 
         Ok(())
@@ -520,6 +467,25 @@ impl SessionManager {
                 ))
             })?;
 
+        // Restrictive permissions: session file contains a secret token
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            tokio::fs::set_permissions(&self.config.session_path, perms)
+                .await
+                .map_err(|e| {
+                    LlmError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "Failed to set permissions on {}: {}",
+                            self.config.session_path.display(),
+                            e
+                        ),
+                    ))
+                })?;
+        }
+
         tracing::debug!("Session saved to {}", self.config.session_path.display());
 
         // Also save to DB if a store is attached
@@ -551,17 +517,40 @@ impl SessionManager {
             })?;
 
         let user_id = self.user_id.read().await.clone();
-        let value = store
+        let value = if let Some(value) = store
             .get_setting(&user_id, "nearai.session_token")
             .await
             .map_err(|e| LlmError::SessionRenewalFailed {
-                provider: "nearai".to_string(),
-                reason: format!("DB query failed: {}", e),
-            })?
-            .ok_or_else(|| LlmError::SessionRenewalFailed {
-                provider: "nearai".to_string(),
-                reason: "No session in DB".to_string(),
-            })?;
+            provider: "nearai".to_string(),
+            reason: format!("DB query failed: {}", e),
+        })? {
+            value
+        } else {
+            // Try the legacy key. Only warn if it actually exists (real
+            // backwards-compat migration). When neither key is present
+            // (fresh install), just return the "No session in DB" error.
+            let legacy = store
+                .get_setting(&user_id, "nearai.session")
+                .await
+                .map_err(|e| LlmError::SessionRenewalFailed {
+                    provider: "nearai".to_string(),
+                    reason: format!("DB query failed: {}", e),
+                })?;
+            match legacy {
+                Some(value) => {
+                    tracing::warn!(
+                        "nearai.session_token missing; falling back to legacy nearai.session for backwards compatibility"
+                    );
+                    value
+                }
+                None => {
+                    return Err(LlmError::SessionRenewalFailed {
+                        provider: "nearai".to_string(),
+                        reason: "No session in DB".to_string(),
+                    });
+                }
+            }
+        };
 
         let session: SessionData =
             serde_json::from_value(value).map_err(|e| LlmError::SessionRenewalFailed {
@@ -618,21 +607,21 @@ impl SessionManager {
     }
 }
 
-/// Create a session manager from a config, migrating from env var if present.
+/// Create a session manager from a config, loading env var if present.
+///
+/// When `NEARAI_SESSION_TOKEN` is set, it takes precedence over file-based
+/// tokens. This supports hosting providers that inject the token via env var.
 pub async fn create_session_manager(config: SessionConfig) -> Arc<SessionManager> {
     let manager = SessionManager::new_async(config).await;
 
-    // Check for legacy env var and migrate if present and no file token
-    if !manager.has_token().await {
-        if let Ok(token) = std::env::var("NEARAI_SESSION_TOKEN") {
-            if !token.is_empty() {
-                tracing::info!("Migrating session token from NEARAI_SESSION_TOKEN env var to file");
-                manager.set_token(SecretString::from(token.clone())).await;
-                if let Err(e) = manager.save_session(&token, None).await {
-                    tracing::warn!("Failed to save migrated session: {}", e);
-                }
-            }
-        }
+    // NEARAI_SESSION_TOKEN env var always takes precedence over file-based
+    // tokens. Hosting providers set this env var and expect it to be used
+    // directly — no file persistence needed.
+    if let Ok(token) = std::env::var("NEARAI_SESSION_TOKEN")
+        && !token.is_empty()
+    {
+        tracing::info!("Using session token from NEARAI_SESSION_TOKEN env var");
+        manager.set_token(SecretString::from(token)).await;
     }
 
     Arc::new(manager)
@@ -652,7 +641,6 @@ mod tests {
         let config = SessionConfig {
             auth_base_url: "https://example.com".to_string(),
             session_path: session_path.clone(),
-            callback_port_range: (9900, 9910),
         };
 
         let manager = SessionManager::new_async(config.clone()).await;
@@ -693,7 +681,6 @@ mod tests {
         let config = SessionConfig {
             auth_base_url: "https://example.com".to_string(),
             session_path: dir.path().join("nonexistent.json"),
-            callback_port_range: (9900, 9910),
         };
 
         let manager = SessionManager::new_async(config).await;

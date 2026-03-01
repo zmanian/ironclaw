@@ -21,6 +21,7 @@ use secrecy::SecretString;
 /// Display a numbered menu and get user selection.
 ///
 /// Returns the index (0-based) of the selected option.
+/// Pressing Enter without input selects the first option (index 0).
 ///
 /// # Example
 ///
@@ -54,10 +55,11 @@ pub fn select_one(prompt: &str, options: &[&str]) -> io::Result<usize> {
         }
 
         // Parse number
-        if let Ok(num) = input.parse::<usize>() {
-            if num >= 1 && num <= options.len() {
-                return Ok(num - 1);
-            }
+        if let Ok(num) = input.parse::<usize>()
+            && num >= 1
+            && num <= options.len()
+        {
+            return Ok(num - 1);
         }
 
         writeln!(
@@ -83,6 +85,10 @@ pub fn select_one(prompt: &str, options: &[&str]) -> io::Result<usize> {
 /// ])?;
 /// ```
 pub fn select_many(prompt: &str, options: &[(&str, bool)]) -> io::Result<Vec<usize>> {
+    if options.is_empty() {
+        return Ok(vec![]);
+    }
+
     let mut stdout = io::stdout();
     let mut selected: Vec<bool> = options.iter().map(|(_, s)| *s).collect();
     let mut cursor_pos = 0;
@@ -287,19 +293,31 @@ pub fn print_step(current: usize, total: usize, name: &str) {
     println!();
 }
 
-/// Print a success message with checkmark.
+/// Print a success message with green checkmark.
 pub fn print_success(message: &str) {
-    println!("✓ {}", message);
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, SetForegroundColor(Color::Green));
+    print!("✓");
+    let _ = execute!(stdout, ResetColor);
+    println!(" {}", message);
 }
 
-/// Print an error message.
+/// Print an error message with red X.
 pub fn print_error(message: &str) {
-    eprintln!("✗ {}", message);
+    let mut stderr = io::stderr();
+    let _ = execute!(stderr, SetForegroundColor(Color::Red));
+    eprint!("✗");
+    let _ = execute!(stderr, ResetColor);
+    eprintln!(" {}", message);
 }
 
-/// Print an info message.
+/// Print an info message with blue info icon.
 pub fn print_info(message: &str) {
-    println!("  {}", message);
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, SetForegroundColor(Color::Blue));
+    print!("ℹ");
+    let _ = execute!(stdout, ResetColor);
+    println!(" {}", message);
 }
 
 /// Read a simple line of input with a prompt.
@@ -351,5 +369,16 @@ mod tests {
     fn test_step_indicator() {
         super::print_step(1, 3, "Test Step");
         super::print_step(3, 3, "Final Step");
+    }
+
+    #[test]
+    fn test_print_functions_do_not_panic() {
+        super::print_success("operation completed");
+        super::print_error("something went wrong");
+        super::print_info("here is some information");
+        // Also test with empty strings
+        super::print_success("");
+        super::print_error("");
+        super::print_info("");
     }
 }

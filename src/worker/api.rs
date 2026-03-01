@@ -40,6 +40,7 @@ pub struct JobDescription {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProxyCompletionRequest {
     pub messages: Vec<ChatMessage>,
+    pub model: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub stop_sequences: Option<Vec<String>>,
@@ -57,6 +58,7 @@ pub struct ProxyCompletionResponse {
 pub struct ProxyToolCompletionRequest {
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ToolDefinition>,
+    pub model: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub tool_choice: Option<String>,
@@ -94,6 +96,15 @@ pub struct PromptResponse {
     pub done: bool,
 }
 
+/// A single credential delivered from the orchestrator to a container worker.
+///
+/// Shared between the orchestrator endpoint and the worker client.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CredentialResponse {
+    pub env_var: String,
+    pub value: String,
+}
+
 impl WorkerHttpClient {
     /// Create a new client from environment.
     ///
@@ -129,11 +140,15 @@ impl WorkerHttpClient {
         format!("{}/worker/{}/{}", self.orchestrator_url, self.job_id, path)
     }
 
-    /// Fetch the job description from the orchestrator.
-    pub async fn get_job(&self) -> Result<JobDescription, WorkerError> {
+    /// Send a GET request, check the status, and deserialize the JSON body.
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        context: &str,
+    ) -> Result<T, WorkerError> {
         let resp = self
             .client
-            .get(self.url("job"))
+            .get(self.url(path))
             .bearer_auth(&self.token)
             .send()
             .await
@@ -145,13 +160,49 @@ impl WorkerHttpClient {
         if !resp.status().is_success() {
             return Err(WorkerError::OrchestratorRejected {
                 job_id: self.job_id,
-                reason: format!("GET /job returned {}", resp.status()),
+                reason: format!("{} returned {}", context, resp.status()),
             });
         }
 
         resp.json().await.map_err(|e| WorkerError::LlmProxyFailed {
-            reason: format!("failed to parse job description: {}", e),
+            reason: format!("{}: failed to parse response: {}", context, e),
         })
+    }
+
+    /// Send a POST request with a JSON body, check the status, and deserialize the response.
+    async fn post_json<B: Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        context: &str,
+    ) -> Result<T, WorkerError> {
+        let resp = self
+            .client
+            .post(self.url(path))
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| WorkerError::LlmProxyFailed {
+                reason: format!("{}: {}", context, e),
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(WorkerError::LlmProxyFailed {
+                reason: format!("{}: orchestrator returned {}: {}", context, status, body),
+            });
+        }
+
+        resp.json().await.map_err(|e| WorkerError::LlmProxyFailed {
+            reason: format!("{}: failed to parse response: {}", context, e),
+        })
+    }
+
+    /// Fetch the job description from the orchestrator.
+    pub async fn get_job(&self) -> Result<JobDescription, WorkerError> {
+        self.get_json("job", "GET /job").await
     }
 
     /// Proxy an LLM completion request through the orchestrator.
@@ -161,41 +212,21 @@ impl WorkerHttpClient {
     ) -> Result<CompletionResponse, WorkerError> {
         let proxy_req = ProxyCompletionRequest {
             messages: request.messages.clone(),
+            model: request.model.clone(),
             max_tokens: request.max_tokens,
             temperature: request.temperature,
             stop_sequences: request.stop_sequences.clone(),
         };
 
-        let resp = self
-            .client
-            .post(self.url("llm/complete"))
-            .bearer_auth(&self.token)
-            .json(&proxy_req)
-            .send()
-            .await
-            .map_err(|e| WorkerError::LlmProxyFailed {
-                reason: e.to_string(),
-            })?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(WorkerError::LlmProxyFailed {
-                reason: format!("orchestrator returned {}: {}", status, body),
-            });
-        }
-
-        let proxy_resp: ProxyCompletionResponse =
-            resp.json().await.map_err(|e| WorkerError::LlmProxyFailed {
-                reason: format!("failed to parse LLM response: {}", e),
-            })?;
+        let proxy_resp: ProxyCompletionResponse = self
+            .post_json("llm/complete", &proxy_req, "LLM complete")
+            .await?;
 
         Ok(CompletionResponse {
             content: proxy_resp.content,
             input_tokens: proxy_resp.input_tokens,
             output_tokens: proxy_resp.output_tokens,
             finish_reason: parse_finish_reason(&proxy_resp.finish_reason),
-            response_id: None,
         })
     }
 
@@ -207,34 +238,15 @@ impl WorkerHttpClient {
         let proxy_req = ProxyToolCompletionRequest {
             messages: request.messages.clone(),
             tools: request.tools.clone(),
+            model: request.model.clone(),
             max_tokens: request.max_tokens,
             temperature: request.temperature,
             tool_choice: request.tool_choice.clone(),
         };
 
-        let resp = self
-            .client
-            .post(self.url("llm/complete_with_tools"))
-            .bearer_auth(&self.token)
-            .json(&proxy_req)
-            .send()
-            .await
-            .map_err(|e| WorkerError::LlmProxyFailed {
-                reason: e.to_string(),
-            })?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(WorkerError::LlmProxyFailed {
-                reason: format!("orchestrator returned {}: {}", status, body),
-            });
-        }
-
-        let proxy_resp: ProxyToolCompletionResponse =
-            resp.json().await.map_err(|e| WorkerError::LlmProxyFailed {
-                reason: format!("failed to parse tool completion response: {}", e),
-            })?;
+        let proxy_resp: ProxyToolCompletionResponse = self
+            .post_json("llm/complete_with_tools", &proxy_req, "LLM tool complete")
+            .await?;
 
         Ok(ToolCompletionResponse {
             content: proxy_resp.content,
@@ -242,7 +254,6 @@ impl WorkerHttpClient {
             input_tokens: proxy_resp.input_tokens,
             output_tokens: proxy_resp.output_tokens,
             finish_reason: parse_finish_reason(&proxy_resp.finish_reason),
-            response_id: None,
         })
     }
 
@@ -335,13 +346,16 @@ impl WorkerHttpClient {
         Ok(Some(prompt))
     }
 
-    /// Signal job completion to the orchestrator.
-    pub async fn report_complete(&self, report: &CompletionReport) -> Result<(), WorkerError> {
+    /// Fetch credentials granted to this job from the orchestrator.
+    ///
+    /// Returns an empty vec if no credentials are granted (204 No Content)
+    /// or if the endpoint returns 404. The caller should set each credential
+    /// as an environment variable before starting the execution loop.
+    pub async fn fetch_credentials(&self) -> Result<Vec<CredentialResponse>, WorkerError> {
         let resp = self
             .client
-            .post(self.url("complete"))
+            .get(self.url("credentials"))
             .bearer_auth(&self.token)
-            .json(report)
             .send()
             .await
             .map_err(|e| WorkerError::ConnectionFailed {
@@ -349,13 +363,33 @@ impl WorkerHttpClient {
                 reason: e.to_string(),
             })?;
 
+        // 204 or 404 means no credentials granted, not an error
+        if resp.status() == reqwest::StatusCode::NO_CONTENT
+            || resp.status() == reqwest::StatusCode::NOT_FOUND
+        {
+            return Ok(vec![]);
+        }
+
         if !resp.status().is_success() {
-            return Err(WorkerError::OrchestratorRejected {
-                job_id: self.job_id,
-                reason: format!("completion report rejected: {}", resp.status()),
+            return Err(WorkerError::SecretResolveFailed {
+                secret_name: "(all)".to_string(),
+                reason: format!("credentials endpoint returned {}", resp.status()),
             });
         }
 
+        resp.json()
+            .await
+            .map_err(|e| WorkerError::SecretResolveFailed {
+                secret_name: "(all)".to_string(),
+                reason: format!("failed to parse credentials response: {}", e),
+            })
+    }
+
+    /// Signal job completion to the orchestrator.
+    pub async fn report_complete(&self, report: &CompletionReport) -> Result<(), WorkerError> {
+        let _: serde_json::Value = self
+            .post_json("complete", report, "report complete")
+            .await?;
         Ok(())
     }
 }
@@ -396,5 +430,31 @@ mod tests {
         assert_eq!(parse_finish_reason("stop"), FinishReason::Stop);
         assert_eq!(parse_finish_reason("tool_use"), FinishReason::ToolUse);
         assert_eq!(parse_finish_reason("unknown"), FinishReason::Unknown);
+    }
+
+    #[test]
+    fn test_credentials_url_construction() {
+        let client = WorkerHttpClient::new(
+            "http://host.docker.internal:50051".to_string(),
+            Uuid::nil(),
+            "test-token".to_string(),
+        );
+
+        assert_eq!(
+            client.url("credentials"),
+            format!(
+                "http://host.docker.internal:50051/worker/{}/credentials",
+                Uuid::nil()
+            )
+        );
+    }
+
+    #[test]
+    fn test_job_description_deserialization() {
+        let json = r#"{"title":"Test","description":"desc","project_dir":null}"#;
+        let job: JobDescription = serde_json::from_str(json).unwrap();
+        assert_eq!(job.title, "Test");
+        assert_eq!(job.description, "desc");
+        assert!(job.project_dir.is_none());
     }
 }

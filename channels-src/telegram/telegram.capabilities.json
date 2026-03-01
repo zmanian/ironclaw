@@ -2,6 +2,15 @@
   "type": "channel",
   "name": "telegram",
   "description": "Telegram Bot API channel for receiving and responding to Telegram messages",
+  "setup": {
+    "required_secrets": [
+      {
+        "name": "telegram_bot_token",
+        "prompt": "Enter your Telegram Bot API token (from @BotFather)",
+        "optional": false
+      }
+    ]
+  },
   "capabilities": {
     "http": {
       "allowlist": [
@@ -26,7 +35,6 @@
       "allowed_paths": ["/webhook/telegram"],
       "allow_polling": true,
       "min_poll_interval_ms": 30000,
-      "callback_timeout_secs": 45,
       "workspace_prefix": "channels/telegram/",
       "emit_rate_limit": {
         "messages_per_minute": 100,
@@ -39,6 +47,8 @@
     "owner_id": null,
     "respond_to_all_group_messages": false,
     "polling_enabled": false,
-    "poll_interval_ms": 30000
+    "poll_interval_ms": 30000,
+    "dm_policy": "pairing",
+    "allow_from": []
   }
 }

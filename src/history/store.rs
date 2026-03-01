@@ -1,13 +1,18 @@
 //! PostgreSQL store for persisting agent data.
 
 use chrono::{DateTime, Utc};
+#[cfg(feature = "postgres")]
 use deadpool_postgres::{Config, Pool, Runtime};
 use rust_decimal::Decimal;
+#[cfg(feature = "postgres")]
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 
+#[cfg(feature = "postgres")]
 use crate::config::DatabaseConfig;
+#[cfg(feature = "postgres")]
 use crate::context::{ActionRecord, JobContext, JobState};
+#[cfg(feature = "postgres")]
 use crate::error::DatabaseError;
 
 /// Record for an LLM call to be persisted.
@@ -24,11 +29,18 @@ pub struct LlmCallRecord<'a> {
 }
 
 /// Database store for the agent.
+#[cfg(feature = "postgres")]
 pub struct Store {
     pool: Pool,
 }
 
+#[cfg(feature = "postgres")]
 impl Store {
+    /// Wrap an existing pool (useful when the caller already has a connection).
+    pub fn from_pool(pool: Pool) -> Self {
+        Self { pool }
+    }
+
     /// Create a new store and connect to the database.
     pub async fn new(config: &DatabaseConfig) -> Result<Self, DatabaseError> {
         let mut cfg = Config::new();
@@ -144,7 +156,12 @@ impl Store {
                 actual_cost, repair_attempts, created_at, started_at, completed_at
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             ON CONFLICT (id) DO UPDATE SET
+                title = EXCLUDED.title,
+                description = EXCLUDED.description,
+                category = EXCLUDED.category,
                 status = EXCLUDED.status,
+                estimated_cost = EXCLUDED.estimated_cost,
+                estimated_time_secs = EXCLUDED.estimated_time_secs,
                 actual_cost = EXCLUDED.actual_cost,
                 repair_attempts = EXCLUDED.repair_attempts,
                 started_at = EXCLUDED.started_at,
@@ -220,6 +237,9 @@ impl Store {
                     completed_at: row.get("completed_at"),
                     transitions: Vec::new(), // Not loaded from DB for now
                     metadata: serde_json::Value::Null,
+                    total_tokens_used: 0,
+                    max_tokens: 0,
+                    extra_env: std::sync::Arc::new(std::collections::HashMap::new()),
                 }))
             }
             None => Ok(None),
@@ -451,6 +471,9 @@ pub struct SandboxJobRecord {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// Serialized JSON of `Vec<CredentialGrant>` for restart support.
+    /// Stored in the `description` column of `agent_jobs` (unused for sandbox jobs).
+    pub credential_grants_json: String,
 }
 
 /// Summary of sandbox job counts grouped by status.
@@ -464,6 +487,46 @@ pub struct SandboxJobSummary {
     pub interrupted: usize,
 }
 
+/// Lightweight record for agent (non-sandbox) jobs, used by the web Jobs tab.
+#[derive(Debug, Clone)]
+pub struct AgentJobRecord {
+    pub id: Uuid,
+    pub title: String,
+    pub status: String,
+    pub user_id: String,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub failure_reason: Option<String>,
+}
+
+/// Summary counts for agent (non-sandbox) jobs.
+#[derive(Debug, Clone, Default)]
+pub struct AgentJobSummary {
+    pub total: usize,
+    pub pending: usize,
+    pub in_progress: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub stuck: usize,
+}
+
+impl AgentJobSummary {
+    /// Accumulate a status/count pair into the summary buckets.
+    pub fn add_count(&mut self, status: &str, count: usize) {
+        self.total += count;
+        match status {
+            "pending" => self.pending += count,
+            "in_progress" => self.in_progress += count,
+            "completed" | "submitted" | "accepted" => self.completed += count,
+            "failed" | "cancelled" => self.failed += count,
+            "stuck" => self.stuck += count,
+            _ => {}
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
 impl Store {
     /// Insert a new sandbox job into `agent_jobs`.
     pub async fn save_sandbox_job(&self, job: &SandboxJobRecord) -> Result<(), DatabaseError> {
@@ -473,7 +536,7 @@ impl Store {
             INSERT INTO agent_jobs (
                 id, title, description, status, source, user_id, project_dir,
                 success, failure_reason, created_at, started_at, completed_at
-            ) VALUES ($1, $2, '', $3, 'sandbox', $4, $5, $6, $7, $8, $9, $10)
+            ) VALUES ($1, $2, $3, $4, 'sandbox', $5, $6, $7, $8, $9, $10, $11)
             ON CONFLICT (id) DO UPDATE SET
                 status = EXCLUDED.status,
                 success = EXCLUDED.success,
@@ -484,6 +547,7 @@ impl Store {
             &[
                 &job.id,
                 &job.task,
+                &job.credential_grants_json,
                 &job.status,
                 &job.user_id,
                 &job.project_dir,
@@ -507,7 +571,7 @@ impl Store {
         let row = conn
             .query_opt(
                 r#"
-                SELECT id, title, status, user_id, project_dir,
+                SELECT id, title, description, status, user_id, project_dir,
                        success, failure_reason, created_at, started_at, completed_at
                 FROM agent_jobs WHERE id = $1 AND source = 'sandbox'
                 "#,
@@ -528,6 +592,7 @@ impl Store {
             created_at: r.get("created_at"),
             started_at: r.get("started_at"),
             completed_at: r.get("completed_at"),
+            credential_grants_json: r.get::<_, String>("description"),
         }))
     }
 
@@ -537,7 +602,7 @@ impl Store {
         let rows = conn
             .query(
                 r#"
-                SELECT id, title, status, user_id, project_dir,
+                SELECT id, title, description, status, user_id, project_dir,
                        success, failure_reason, created_at, started_at, completed_at
                 FROM agent_jobs WHERE source = 'sandbox'
                 ORDER BY created_at DESC
@@ -561,8 +626,94 @@ impl Store {
                 created_at: r.get("created_at"),
                 started_at: r.get("started_at"),
                 completed_at: r.get("completed_at"),
+                credential_grants_json: r.get::<_, String>("description"),
             })
             .collect())
+    }
+
+    /// List sandbox jobs for a specific user, most recent first.
+    pub async fn list_sandbox_jobs_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<SandboxJobRecord>, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, title, description, status, user_id, project_dir,
+                       success, failure_reason, created_at, started_at, completed_at
+                FROM agent_jobs WHERE source = 'sandbox' AND user_id = $1
+                ORDER BY created_at DESC
+                "#,
+                &[&user_id],
+            )
+            .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| SandboxJobRecord {
+                id: r.get("id"),
+                task: r.get("title"),
+                status: r.get("status"),
+                user_id: r.get("user_id"),
+                project_dir: r
+                    .get::<_, Option<String>>("project_dir")
+                    .unwrap_or_default(),
+                success: r.get("success"),
+                failure_reason: r.get("failure_reason"),
+                created_at: r.get("created_at"),
+                started_at: r.get("started_at"),
+                completed_at: r.get("completed_at"),
+                credential_grants_json: r.get::<_, String>("description"),
+            })
+            .collect())
+    }
+
+    /// Get a summary of sandbox job counts by status for a specific user.
+    pub async fn sandbox_job_summary_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<SandboxJobSummary, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT status, COUNT(*) as cnt FROM agent_jobs WHERE source = 'sandbox' AND user_id = $1 GROUP BY status",
+                &[&user_id],
+            )
+            .await?;
+
+        let mut summary = SandboxJobSummary::default();
+        for row in &rows {
+            let status: String = row.get("status");
+            let count: i64 = row.get("cnt");
+            let c = count as usize;
+            summary.total += c;
+            match status.as_str() {
+                "creating" => summary.creating += c,
+                "running" => summary.running += c,
+                "completed" => summary.completed += c,
+                "failed" => summary.failed += c,
+                "interrupted" => summary.interrupted += c,
+                _ => {}
+            }
+        }
+        Ok(summary)
+    }
+
+    /// Check if a sandbox job belongs to a specific user.
+    pub async fn sandbox_job_belongs_to_user(
+        &self,
+        job_id: Uuid,
+        user_id: &str,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT 1 FROM agent_jobs WHERE id = $1 AND user_id = $2 AND source = 'sandbox'",
+                &[&job_id, &user_id],
+            )
+            .await?;
+        Ok(row.is_some())
     }
 
     /// Update sandbox job status and optional timestamps/result.
@@ -642,6 +793,55 @@ impl Store {
         }
         Ok(summary)
     }
+
+    /// List all agent (non-sandbox) jobs, most recent first.
+    pub async fn list_agent_jobs(&self) -> Result<Vec<AgentJobRecord>, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, title, status, user_id, failure_reason,
+                       created_at, started_at, completed_at
+                FROM agent_jobs WHERE source = 'direct'
+                ORDER BY created_at DESC
+                "#,
+                &[],
+            )
+            .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| AgentJobRecord {
+                id: r.get("id"),
+                title: r.get("title"),
+                status: r.get("status"),
+                user_id: r.get::<_, Option<String>>("user_id").unwrap_or_default(),
+                created_at: r.get("created_at"),
+                started_at: r.get("started_at"),
+                completed_at: r.get("completed_at"),
+                failure_reason: r.get("failure_reason"),
+            })
+            .collect())
+    }
+
+    /// Summary counts for agent (non-sandbox) jobs.
+    pub async fn agent_job_summary(&self) -> Result<AgentJobSummary, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT status, COUNT(*) as cnt FROM agent_jobs WHERE source = 'direct' GROUP BY status",
+                &[],
+            )
+            .await?;
+
+        let mut summary = AgentJobSummary::default();
+        for row in &rows {
+            let status: String = row.get("status");
+            let count: i64 = row.get("cnt");
+            summary.add_count(&status, count as usize);
+        }
+        Ok(summary)
+    }
 }
 
 // ==================== Job Events ====================
@@ -656,6 +856,7 @@ pub struct JobEventRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[cfg(feature = "postgres")]
 impl Store {
     /// Persist a job event (fire-and-forget from orchestrator handler).
     pub async fn save_job_event(
@@ -676,14 +877,35 @@ impl Store {
         Ok(())
     }
 
-    /// Load all job events for a job, ordered by id.
+    /// Load job events for a job, ordered by id.
+    ///
+    /// When `limit` is `Some(n)`, returns the **most recent** `n` events
+    /// (ordered ascending by id). When `None`, returns all events.
     pub async fn list_job_events(
         &self,
         job_id: Uuid,
+        limit: Option<i64>,
     ) -> Result<Vec<JobEventRecord>, DatabaseError> {
         let conn = self.conn().await?;
-        let rows = conn
-            .query(
+        let rows = if let Some(n) = limit {
+            // Sub-select the last N rows by id DESC, then re-sort ASC.
+            conn.query(
+                r#"
+                SELECT id, job_id, event_type, data, created_at
+                FROM (
+                    SELECT id, job_id, event_type, data, created_at
+                    FROM job_events
+                    WHERE job_id = $1
+                    ORDER BY id DESC
+                    LIMIT $2
+                ) sub
+                ORDER BY id ASC
+                "#,
+                &[&job_id, &n],
+            )
+            .await?
+        } else {
+            conn.query(
                 r#"
                 SELECT id, job_id, event_type, data, created_at
                 FROM job_events
@@ -692,7 +914,8 @@ impl Store {
                 "#,
                 &[&job_id],
             )
-            .await?;
+            .await?
+        };
         Ok(rows
             .iter()
             .map(|r| JobEventRecord {
@@ -728,10 +951,12 @@ impl Store {
 
 // ==================== Routines ====================
 
+#[cfg(feature = "postgres")]
 use crate::agent::routine::{
     NotifyConfig, Routine, RoutineAction, RoutineGuardrails, RoutineRun, RunStatus, Trigger,
 };
 
+#[cfg(feature = "postgres")]
 impl Store {
     /// Create a new routine.
     pub async fn create_routine(&self, routine: &Routine) -> Result<(), DatabaseError> {
@@ -822,6 +1047,15 @@ impl Store {
                 "SELECT * FROM routines WHERE user_id = $1 ORDER BY name",
                 &[&user_id],
             )
+            .await?;
+        rows.iter().map(row_to_routine).collect()
+    }
+
+    /// List all routines across all users.
+    pub async fn list_all_routines(&self) -> Result<Vec<Routine>, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query("SELECT * FROM routines ORDER BY name", &[])
             .await?;
         rows.iter().map(row_to_routine).collect()
     }
@@ -1030,8 +1264,24 @@ impl Store {
             .await?;
         Ok(row.get("cnt"))
     }
+
+    /// Link a routine run to a dispatched job.
+    pub async fn link_routine_run_to_job(
+        &self,
+        run_id: Uuid,
+        job_id: Uuid,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.conn().await?;
+        conn.execute(
+            "UPDATE routine_runs SET job_id = $1 WHERE id = $2",
+            &[&job_id, &run_id],
+        )
+        .await?;
+        Ok(())
+    }
 }
 
+#[cfg(feature = "postgres")]
 fn row_to_routine(row: &tokio_postgres::Row) -> Result<Routine, DatabaseError> {
     let trigger_type: String = row.get("trigger_type");
     let trigger_config: serde_json::Value = row.get("trigger_config");
@@ -1041,10 +1291,10 @@ fn row_to_routine(row: &tokio_postgres::Row) -> Result<Routine, DatabaseError> {
     let max_concurrent: i32 = row.get("max_concurrent");
     let dedup_window_secs: Option<i32> = row.get("dedup_window_secs");
 
-    let trigger =
-        Trigger::from_db(&trigger_type, trigger_config).map_err(DatabaseError::Serialization)?;
+    let trigger = Trigger::from_db(&trigger_type, trigger_config)
+        .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
     let action = RoutineAction::from_db(&action_type, action_config)
-        .map_err(DatabaseError::Serialization)?;
+        .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
     Ok(Routine {
         id: row.get("id"),
@@ -1076,11 +1326,12 @@ fn row_to_routine(row: &tokio_postgres::Row) -> Result<Routine, DatabaseError> {
     })
 }
 
+#[cfg(feature = "postgres")]
 fn row_to_routine_run(row: &tokio_postgres::Row) -> Result<RoutineRun, DatabaseError> {
     let status_str: String = row.get("status");
     let status: RunStatus = status_str
         .parse()
-        .map_err(|e: String| DatabaseError::Serialization(e))?;
+        .map_err(|e: crate::error::RoutineError| DatabaseError::Serialization(e.to_string()))?;
 
     Ok(RoutineRun {
         id: row.get("id"),
@@ -1121,6 +1372,7 @@ pub struct ConversationMessage {
     pub created_at: DateTime<Utc>,
 }
 
+#[cfg(feature = "postgres")]
 impl Store {
     /// Ensure a conversation row exists for a given UUID.
     ///
@@ -1161,7 +1413,7 @@ impl Store {
                     c.started_at,
                     c.last_activity,
                     c.metadata,
-                    (SELECT COUNT(*) FROM conversation_messages m WHERE m.conversation_id = c.id) AS message_count,
+                    (SELECT COUNT(*) FROM conversation_messages m WHERE m.conversation_id = c.id AND m.role = 'user') AS message_count,
                     (SELECT LEFT(m2.content, 100)
                      FROM conversation_messages m2
                      WHERE m2.conversation_id = c.id AND m2.role = 'user'
@@ -1256,6 +1508,22 @@ impl Store {
         .await?;
 
         Ok(id)
+    }
+
+    /// Check whether a conversation belongs to the given user.
+    pub async fn conversation_belongs_to_user(
+        &self,
+        conversation_id: Uuid,
+        user_id: &str,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT 1 FROM conversations WHERE id = $1 AND user_id = $2",
+                &[&conversation_id, &user_id],
+            )
+            .await?;
+        Ok(row.is_some())
     }
 
     /// Load messages for a conversation with cursor-based pagination.
@@ -1375,6 +1643,7 @@ impl Store {
     }
 }
 
+#[cfg(feature = "postgres")]
 fn parse_job_state(s: &str) -> JobState {
     match s {
         "pending" => JobState::Pending,
@@ -1391,8 +1660,10 @@ fn parse_job_state(s: &str) -> JobState {
 
 // ==================== Tool Failures ====================
 
+#[cfg(feature = "postgres")]
 use crate::agent::BrokenTool;
 
+#[cfg(feature = "postgres")]
 impl Store {
     /// Record a tool failure (upsert: increment count if exists).
     pub async fn record_tool_failure(
@@ -1486,6 +1757,7 @@ pub struct SettingRow {
     pub updated_at: DateTime<Utc>,
 }
 
+#[cfg(feature = "postgres")]
 impl Store {
     /// Get a single setting by key.
     pub async fn get_setting(

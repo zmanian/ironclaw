@@ -62,6 +62,23 @@ impl SubmissionParser {
                 args: vec![],
             };
         }
+        if lower == "/skills" {
+            return Submission::SystemCommand {
+                command: "skills".to_string(),
+                args: vec![],
+            };
+        }
+        if lower.starts_with("/skills ") {
+            let args: Vec<String> = trimmed
+                .split_whitespace()
+                .skip(1)
+                .map(|s| s.to_string())
+                .collect();
+            return Submission::SystemCommand {
+                command: "skills".to_string(),
+                args,
+            };
+        }
         if lower == "/ping" {
             return Submission::SystemCommand {
                 command: "ping".to_string(),
@@ -90,48 +107,70 @@ impl SubmissionParser {
             return Submission::Quit;
         }
 
+        // Job commands
+        if lower == "/status" || lower == "/progress" {
+            return Submission::JobStatus { job_id: None };
+        }
+        if let Some(rest) = lower
+            .strip_prefix("/status ")
+            .or_else(|| lower.strip_prefix("/progress "))
+        {
+            let id = rest.trim().to_string();
+            if !id.is_empty() {
+                return Submission::JobStatus { job_id: Some(id) };
+            }
+        }
+        if lower == "/list" {
+            return Submission::JobStatus { job_id: None };
+        }
+        if let Some(rest) = lower.strip_prefix("/cancel ") {
+            let id = rest.trim().to_string();
+            if !id.is_empty() {
+                return Submission::JobCancel { job_id: id };
+            }
+        }
+
         // /thread <uuid> - switch thread
         if let Some(rest) = lower.strip_prefix("/thread ") {
             let rest = rest.trim();
-            if rest != "new" {
-                if let Ok(id) = Uuid::parse_str(rest) {
-                    return Submission::SwitchThread { thread_id: id };
-                }
+            if rest != "new"
+                && let Ok(id) = Uuid::parse_str(rest)
+            {
+                return Submission::SwitchThread { thread_id: id };
             }
         }
 
         // /resume <uuid> - resume from checkpoint
-        if let Some(rest) = lower.strip_prefix("/resume ") {
-            if let Ok(id) = Uuid::parse_str(rest.trim()) {
-                return Submission::Resume { checkpoint_id: id };
-            }
+        if let Some(rest) = lower.strip_prefix("/resume ")
+            && let Ok(id) = Uuid::parse_str(rest.trim())
+        {
+            return Submission::Resume { checkpoint_id: id };
         }
 
         // Try structured JSON approval (from web gateway's /api/chat/approval endpoint)
-        if trimmed.starts_with('{') {
-            if let Ok(submission) = serde_json::from_str::<Submission>(trimmed) {
-                if matches!(submission, Submission::ExecApproval { .. }) {
-                    return submission;
-                }
-            }
+        if trimmed.starts_with('{')
+            && let Ok(submission) = serde_json::from_str::<Submission>(trimmed)
+            && matches!(submission, Submission::ExecApproval { .. })
+        {
+            return submission;
         }
 
         // Approval responses (simple yes/no/always for pending approvals)
         // These are short enough to check explicitly
         match lower.as_str() {
-            "yes" | "y" | "approve" | "ok" => {
+            "yes" | "y" | "approve" | "ok" | "/approve" | "/yes" | "/y" => {
                 return Submission::ApprovalResponse {
                     approved: true,
                     always: false,
                 };
             }
-            "always" | "yes always" | "approve always" => {
+            "always" | "a" | "yes always" | "approve always" | "/always" | "/a" => {
                 return Submission::ApprovalResponse {
                     approved: true,
                     always: true,
                 };
             }
-            "no" | "n" | "deny" | "reject" | "cancel" => {
+            "no" | "n" | "deny" | "reject" | "cancel" | "/deny" | "/no" | "/n" => {
                 return Submission::ApprovalResponse {
                     approved: false,
                     always: false,
@@ -213,6 +252,18 @@ pub enum Submission {
     /// Suggest next steps based on the current thread.
     Suggest,
 
+    /// Check job status. No job_id shows all jobs; with job_id shows a specific job.
+    JobStatus {
+        /// Optional job ID (UUID or short prefix). If None, shows all jobs.
+        job_id: Option<String>,
+    },
+
+    /// Cancel a running job.
+    JobCancel {
+        /// Job ID (UUID or short prefix).
+        job_id: String,
+    },
+
     /// Quit the agent. Bypasses thread-state checks.
     Quit,
 
@@ -235,6 +286,7 @@ impl Submission {
     }
 
     /// Create an approval submission.
+    #[cfg(test)]
     pub fn approval(request_id: Uuid, approved: bool) -> Self {
         Self::ExecApproval {
             request_id,
@@ -244,6 +296,7 @@ impl Submission {
     }
 
     /// Create an "always approve" submission.
+    #[cfg(test)]
     pub fn always_approve(request_id: Uuid) -> Self {
         Self::ExecApproval {
             request_id,
@@ -253,26 +306,31 @@ impl Submission {
     }
 
     /// Create an interrupt submission.
+    #[cfg(test)]
     pub fn interrupt() -> Self {
         Self::Interrupt
     }
 
     /// Create a compact submission.
+    #[cfg(test)]
     pub fn compact() -> Self {
         Self::Compact
     }
 
     /// Create an undo submission.
+    #[cfg(test)]
     pub fn undo() -> Self {
         Self::Undo
     }
 
     /// Create a redo submission.
+    #[cfg(test)]
     pub fn redo() -> Self {
         Self::Redo
     }
 
     /// Check if this submission starts a new turn.
+    #[cfg(test)]
     pub fn starts_turn(&self) -> bool {
         matches!(self, Self::UserInput { .. })
     }
@@ -290,6 +348,8 @@ impl Submission {
                 | Self::Heartbeat
                 | Self::Summarize
                 | Self::Suggest
+                | Self::JobStatus { .. }
+                | Self::JobCancel { .. }
                 | Self::SystemCommand { .. }
         )
     }
@@ -341,6 +401,7 @@ impl SubmissionResult {
     }
 
     /// Create an OK result.
+    #[cfg(test)]
     pub fn ok() -> Self {
         Self::Ok { message: None }
     }
@@ -474,6 +535,57 @@ mod tests {
         // Unknown command should become user input
         let submission = SubmissionParser::parse("/unknown");
         assert!(matches!(submission, Submission::UserInput { content } if content == "/unknown"));
+    }
+
+    #[test]
+    fn test_parser_approval_response_aliases() {
+        // approve once
+        assert!(matches!(
+            SubmissionParser::parse("y"),
+            Submission::ApprovalResponse {
+                approved: true,
+                always: false
+            }
+        ));
+        assert!(matches!(
+            SubmissionParser::parse("/approve"),
+            Submission::ApprovalResponse {
+                approved: true,
+                always: false
+            }
+        ));
+
+        // approve always
+        assert!(matches!(
+            SubmissionParser::parse("a"),
+            Submission::ApprovalResponse {
+                approved: true,
+                always: true
+            }
+        ));
+        assert!(matches!(
+            SubmissionParser::parse("/always"),
+            Submission::ApprovalResponse {
+                approved: true,
+                always: true
+            }
+        ));
+
+        // deny
+        assert!(matches!(
+            SubmissionParser::parse("n"),
+            Submission::ApprovalResponse {
+                approved: false,
+                always: false
+            }
+        ));
+        assert!(matches!(
+            SubmissionParser::parse("/deny"),
+            Submission::ApprovalResponse {
+                approved: false,
+                always: false
+            }
+        ));
     }
 
     #[test]
@@ -633,6 +745,86 @@ mod tests {
         let submission = SubmissionParser::parse("/help");
         assert!(submission.is_control());
         assert!(!submission.starts_turn());
+    }
+
+    #[test]
+    fn test_parser_system_command_skills() {
+        let submission = SubmissionParser::parse("/skills");
+        assert!(
+            matches!(submission, Submission::SystemCommand { command, args } if command == "skills" && args.is_empty())
+        );
+
+        // Case insensitive
+        let submission = SubmissionParser::parse("/SKILLS");
+        assert!(
+            matches!(submission, Submission::SystemCommand { command, .. } if command == "skills")
+        );
+    }
+
+    #[test]
+    fn test_parser_system_command_skills_search() {
+        let submission = SubmissionParser::parse("/skills search markdown");
+        assert!(
+            matches!(submission, Submission::SystemCommand { command, args }
+                if command == "skills" && args == vec!["search", "markdown"])
+        );
+
+        // Multiple words in query
+        let submission = SubmissionParser::parse("/skills search code review tools");
+        assert!(
+            matches!(submission, Submission::SystemCommand { command, args }
+                if command == "skills" && args == vec!["search", "code", "review", "tools"])
+        );
+    }
+
+    #[test]
+    fn test_parser_job_status() {
+        // /status with no id → all jobs
+        let s = SubmissionParser::parse("/status");
+        assert!(matches!(s, Submission::JobStatus { job_id: None }));
+
+        // /progress alias
+        let s = SubmissionParser::parse("/progress");
+        assert!(matches!(s, Submission::JobStatus { job_id: None }));
+
+        // /status with id
+        let s = SubmissionParser::parse("/status abc123");
+        assert!(matches!(s, Submission::JobStatus { job_id: Some(id) } if id == "abc123"));
+
+        // /progress with id
+        let s = SubmissionParser::parse("/progress abc123");
+        assert!(matches!(s, Submission::JobStatus { job_id: Some(id) } if id == "abc123"));
+
+        // case insensitive
+        let s = SubmissionParser::parse("/STATUS");
+        assert!(matches!(s, Submission::JobStatus { job_id: None }));
+    }
+
+    #[test]
+    fn test_parser_job_list() {
+        // /list is an alias for /status with no job_id
+        let s = SubmissionParser::parse("/list");
+        assert!(matches!(s, Submission::JobStatus { job_id: None }));
+
+        let s = SubmissionParser::parse("/LIST");
+        assert!(matches!(s, Submission::JobStatus { job_id: None }));
+    }
+
+    #[test]
+    fn test_parser_job_cancel() {
+        let s = SubmissionParser::parse("/cancel abc123");
+        assert!(matches!(s, Submission::JobCancel { job_id } if job_id == "abc123"));
+
+        // /cancel with no id → falls through to UserInput
+        let s = SubmissionParser::parse("/cancel");
+        assert!(matches!(s, Submission::UserInput { .. }));
+    }
+
+    #[test]
+    fn test_job_commands_are_control() {
+        assert!(SubmissionParser::parse("/status").is_control());
+        assert!(SubmissionParser::parse("/list").is_control());
+        assert!(SubmissionParser::parse("/cancel abc").is_control());
     }
 
     #[test]

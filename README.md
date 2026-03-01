@@ -1,11 +1,17 @@
 <p align="center">
-  <img src="ironclaw.png" alt="IronClaw" width="200"/>
+  <img src="ironclaw.png?v=2" alt="IronClaw" width="200"/>
 </p>
 
 <h1 align="center">IronClaw</h1>
 
 <p align="center">
   <strong>Your secure personal AI assistant, always on your side</strong>
+</p>
+
+<p align="center">
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
+  <a href="https://t.me/ironclawAI"><img src="https://img.shields.io/badge/Telegram-%40ironclawAI-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @ironclawAI" /></a>
+  <a href="https://www.reddit.com/r/ironclawAI/"><img src="https://img.shields.io/badge/Reddit-r%2FironclawAI-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/ironclawAI" /></a>
 </p>
 
 <p align="center">
@@ -71,7 +77,47 @@ IronClaw is the AI assistant you can actually trust with your personal and profe
 - PostgreSQL 15+ with [pgvector](https://github.com/pgvector/pgvector) extension
 - NEAR AI account (authentication handled via setup wizard)
 
-### Build
+## Download or Build
+
+Visit [Releases page](https://github.com/nearai/ironclaw/releases/) to see the latest updates.
+
+<details>
+  <summary>Install via Windows Installer (Windows)</summary>
+
+Download the [Windows Installer](https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-x86_64-pc-windows-msvc.msi) and run it.
+
+</details>
+
+<details>
+  <summary>Install via powershell script (Windows)</summary>
+
+```sh
+irm https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-installer.ps1 | iex
+```
+
+</details>
+
+<details>
+  <summary>Install via shell script (macOS, Linux, Windows/WSL)</summary>
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-installer.sh | sh
+```
+</details>
+
+<details>
+  <summary>Install via Homebrew (macOS/Linux)</summary>
+
+```sh
+brew install ironclaw
+```
+
+</details>
+
+<details>
+  <summary>Compile the source code (Cargo on Windows, Linux, macOS)</summary>
+
+Install it with `cargo`, just make sure you have [Rust](https://rustup.rs) installed on your computer.
 
 ```bash
 # Clone the repository
@@ -84,6 +130,10 @@ cargo build --release
 # Run tests
 cargo test
 ```
+
+For **full release** (after modifying channel sources), run `./scripts/build-all.sh` to rebuild channels first.
+
+</details>
 
 ### Database Setup
 
@@ -104,8 +154,26 @@ ironclaw onboard
 ```
 
 The wizard handles database connection, NEAR AI authentication (via browser OAuth),
-and secrets encryption (using your system keychain). All settings are saved to
-`~/.ironclaw/settings.toml`.
+and secrets encryption (using your system keychain). Settings are persisted in the
+connected database; bootstrap variables (e.g. `DATABASE_URL`, `LLM_BACKEND`) are
+written to `~/.ironclaw/.env` so they are available before the database connects.
+
+### Alternative LLM Providers
+
+IronClaw defaults to NEAR AI but works with any OpenAI-compatible endpoint.
+Popular options include **OpenRouter** (300+ models), **Together AI**, **Fireworks AI**,
+**Ollama** (local), and self-hosted servers like **vLLM** or **LiteLLM**.
+
+Select *"OpenAI-compatible"* in the wizard, or set environment variables directly:
+
+```env
+LLM_BACKEND=openai_compatible
+LLM_BASE_URL=https://openrouter.ai/api/v1
+LLM_API_KEY=sk-or-...
+LLM_MODEL=anthropic/claude-sonnet-4
+```
+
+See [docs/LLM_PROVIDERS.md](docs/LLM_PROVIDERS.md) for a full provider guide.
 
 ## Security
 
@@ -146,42 +214,42 @@ External content passes through multiple security layers:
 ## Architecture
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│                          Channels                                  │
-│  ┌──────┐  ┌──────┐  ┌─────────────┐  ┌─────────────┐            │
-│  │ REPL │  │ HTTP │  │WASM Channels│  │ Web Gateway │            │
-│  └──┬───┘  └──┬───┘  └──────┬──────┘  │ (SSE + WS) │            │
-│     │         │              │         └──────┬──────┘            │
-│     └─────────┴──────────────┴────────────────┘                   │
-│                              │                                     │
-│                    ┌─────────▼─────────┐                          │
-│                    │    Agent Loop     │  Intent routing           │
-│                    └────┬─────────┬────┘                          │
-│                         │         │                                │
-│              ┌──────────▼───┐  ┌──▼──────────────┐               │
-│              │  Scheduler   │  │ Routines Engine  │               │
-│              │(parallel jobs)│  │(cron, event, wh) │               │
-│              └──────┬───────┘  └────────┬─────────┘               │
-│                     │                   │                          │
-│       ┌─────────────┼───────────────────┘                         │
-│       │             │                                              │
-│   ┌───▼────┐   ┌────▼────────────────┐                           │
-│   │ Local  │   │    Orchestrator     │                           │
-│   │Workers │   │  ┌───────────────┐  │                           │
-│   │(in-proc)│   │  │ Docker Sandbox│  │                           │
-│   └───┬────┘   │  │   Containers  │  │                           │
-│       │        │  │ ┌───────────┐ │  │                           │
-│       │        │  │ │Worker / CC│ │  │                           │
-│       │        │  │ └───────────┘ │  │                           │
-│       │        │  └───────────────┘  │                           │
-│       │        └─────────┬───────────┘                           │
-│       └──────────────────┤                                        │
-│                          │                                        │
-│              ┌───────────▼──────────┐                             │
-│              │    Tool Registry     │                             │
-│              │  Built-in, MCP, WASM │                             │
-│              └──────────────────────┘                             │
-└────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│                          Channels                              │
+│  ┌──────┐  ┌──────┐   ┌─────────────┐  ┌─────────────┐         │
+│  │ REPL │  │ HTTP │   │WASM Channels│  │ Web Gateway │         │
+│  └──┬───┘  └──┬───┘   └──────┬──────┘  │ (SSE + WS)  │         │
+│     │         │              │         └──────┬──────┘         │
+│     └─────────┴──────────────┴────────────────┘                │
+│                              │                                 │
+│                    ┌─────────▼─────────┐                       │
+│                    │    Agent Loop     │  Intent routing       │
+│                    └────┬──────────┬───┘                       │
+│                         │          │                           │
+│              ┌──────────▼────┐  ┌──▼───────────────┐           │
+│              │  Scheduler    │  │ Routines Engine  │           │
+│              │(parallel jobs)│  │(cron, event, wh) │           │
+│              └──────┬────────┘  └────────┬─────────┘           │
+│                     │                    │                     │
+│       ┌─────────────┼────────────────────┘                     │
+│       │             │                                          │
+│   ┌───▼─────┐  ┌────▼────────────────┐                         │
+│   │ Local   │  │    Orchestrator     │                         │
+│   │Workers  │  │  ┌───────────────┐  │                         │
+│   │(in-proc)│  │  │ Docker Sandbox│  │                         │
+│   └───┬─────┘  │  │   Containers  │  │                         │
+│       │        │  │ ┌───────────┐ │  │                         │
+│       │        │  │ │Worker / CC│ │  │                         │
+│       │        │  │ └───────────┘ │  │                         │
+│       │        │  └───────────────┘  │                         │
+│       │        └─────────┬───────────┘                         │
+│       └──────────────────┤                                     │
+│                          │                                     │
+│              ┌───────────▼──────────┐                          │
+│              │    Tool Registry     │                          │
+│              │  Built-in, MCP, WASM │                          │
+│              └──────────────────────┘                          │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 ### Core Components
@@ -227,6 +295,9 @@ cargo test
 # Run specific test
 cargo test test_name
 ```
+
+- **Telegram channel**: See [docs/TELEGRAM_SETUP.md](docs/TELEGRAM_SETUP.md) for setup and DM pairing.
+- **Changing channel sources**: Run `./channels-src/telegram/build.sh` before `cargo build` so the updated WASM is bundled.
 
 ## OpenClaw Heritage
 

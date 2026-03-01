@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bootstrap::ironclaw_base_dir;
+
 /// User settings persisted to disk.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
@@ -15,6 +17,10 @@ pub struct Settings {
     pub onboard_completed: bool,
 
     // === Step 1: Database ===
+    /// Database backend: "postgres" or "libsql".
+    #[serde(default)]
+    pub database_backend: Option<String>,
+
     /// Database connection URL (postgres://...).
     #[serde(default)]
     pub database_url: Option<String>,
@@ -23,13 +29,31 @@ pub struct Settings {
     #[serde(default)]
     pub database_pool_size: Option<usize>,
 
+    /// Path to local libSQL database file.
+    #[serde(default)]
+    pub libsql_path: Option<String>,
+
+    /// Turso cloud URL for remote replica sync.
+    #[serde(default)]
+    pub libsql_url: Option<String>,
+
     // === Step 2: Security ===
     /// Source for the secrets master key.
     #[serde(default)]
     pub secrets_master_key_source: KeySource,
 
-    // === Step 3: NEAR AI Auth ===
-    // Session stored separately in session.json
+    // === Step 3: Inference Provider ===
+    /// LLM backend: "nearai", "anthropic", "openai", "ollama", "openai_compatible".
+    #[serde(default)]
+    pub llm_backend: Option<String>,
+
+    /// Ollama base URL (when llm_backend = "ollama").
+    #[serde(default)]
+    pub ollama_base_url: Option<String>,
+
+    /// OpenAI-compatible endpoint base URL (when llm_backend = "openai_compatible").
+    #[serde(default)]
+    pub openai_compatible_base_url: Option<String>,
 
     // === Step 4: Model Selection ===
     /// Currently selected model.
@@ -127,11 +151,52 @@ impl Default for EmbeddingsSettings {
 /// Tunnel settings for public webhook endpoints.
 ///
 /// The tunnel URL is shared across all channels that need webhooks.
+/// Two modes:
+/// - **Static URL**: `public_url` set directly (manual tunnel management).
+/// - **Managed provider**: `provider` is set and the agent starts/stops the
+///   tunnel process automatically at boot/shutdown.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TunnelSettings {
     /// Public URL from tunnel provider (e.g., "https://abc123.ngrok.io").
+    /// When set without a provider, treated as a static (externally managed) URL.
     #[serde(default)]
     pub public_url: Option<String>,
+
+    /// Managed tunnel provider: "ngrok", "cloudflare", "tailscale", "custom".
+    #[serde(default)]
+    pub provider: Option<String>,
+
+    /// Cloudflare tunnel token.
+    #[serde(default)]
+    pub cf_token: Option<String>,
+
+    /// ngrok auth token.
+    #[serde(default)]
+    pub ngrok_token: Option<String>,
+
+    /// ngrok custom domain (paid plans).
+    #[serde(default)]
+    pub ngrok_domain: Option<String>,
+
+    /// Use Tailscale Funnel (public) instead of Serve (tailnet-only).
+    #[serde(default)]
+    pub ts_funnel: bool,
+
+    /// Tailscale hostname override.
+    #[serde(default)]
+    pub ts_hostname: Option<String>,
+
+    /// Shell command for custom tunnel (with `{port}` / `{host}` placeholders).
+    #[serde(default)]
+    pub custom_command: Option<String>,
+
+    /// Health check URL for custom tunnel.
+    #[serde(default)]
+    pub custom_health_url: Option<String>,
+
+    /// Substring pattern to extract URL from custom tunnel stdout.
+    #[serde(default)]
+    pub custom_url_pattern: Option<String>,
 }
 
 /// Channel-specific settings.
@@ -148,6 +213,41 @@ pub struct ChannelSettings {
     /// HTTP webhook host.
     #[serde(default)]
     pub http_host: Option<String>,
+
+    /// Whether Signal channel is enabled.
+    #[serde(default)]
+    pub signal_enabled: bool,
+
+    /// Signal HTTP URL (signal-cli daemon endpoint).
+    #[serde(default)]
+    pub signal_http_url: Option<String>,
+
+    /// Signal account (E.164 phone number).
+    #[serde(default)]
+    pub signal_account: Option<String>,
+
+    /// Signal allow from list for DMs (comma-separated E.164 phone numbers).
+    /// Comma-separated identifiers: E.164 phone numbers, `*`, bare UUIDs, or `uuid:<id>` entries.
+    /// Defaults to the configured account.
+    #[serde(default)]
+    pub signal_allow_from: Option<String>,
+
+    /// Signal allow from groups (comma-separated group IDs).
+    #[serde(default)]
+    pub signal_allow_from_groups: Option<String>,
+
+    /// Signal DM policy: "open", "allowlist", or "pairing". Default: "pairing".
+    #[serde(default)]
+    pub signal_dm_policy: Option<String>,
+
+    /// Signal group policy: "allowlist", "open", or "disabled". Default: "allowlist".
+    #[serde(default)]
+    pub signal_group_policy: Option<String>,
+
+    /// Signal group allow from (comma-separated group member IDs).
+    /// If empty, inherits from signal_allow_from.
+    #[serde(default)]
+    pub signal_group_allow_from: Option<String>,
 
     /// Telegram owner user ID. When set, the bot only responds to this user.
     /// Captured during setup by having the user message the bot.
@@ -239,6 +339,14 @@ pub struct AgentSettings {
     /// longer than this are pruned from memory.
     #[serde(default = "default_session_idle_timeout")]
     pub session_idle_timeout_secs: u64,
+
+    /// Maximum tool-call iterations per agentic loop invocation (default: 50).
+    #[serde(default = "default_max_tool_iterations")]
+    pub max_tool_iterations: usize,
+
+    /// When true, skip tool approval checks entirely. For benchmarks/CI.
+    #[serde(default)]
+    pub auto_approve_tools: bool,
 }
 
 fn default_agent_name() -> String {
@@ -269,6 +377,10 @@ fn default_max_repair_attempts() -> u32 {
     3
 }
 
+fn default_max_tool_iterations() -> usize {
+    50
+}
+
 fn default_true() -> bool {
     true
 }
@@ -284,6 +396,8 @@ impl Default for AgentSettings {
             repair_check_interval_secs: default_repair_interval(),
             max_repair_attempts: default_max_repair_attempts(),
             session_idle_timeout_secs: default_session_idle_timeout(),
+            max_tool_iterations: default_max_tool_iterations(),
+            auto_approve_tools: false,
         }
     }
 }
@@ -399,7 +513,7 @@ fn default_sandbox_cpu_shares() -> u32 {
 }
 
 fn default_sandbox_image() -> String {
-    "ghcr.io/nearai/sandbox:latest".to_string()
+    "ironclaw-worker:latest".to_string()
 }
 
 impl Default for SandboxSettings {
@@ -487,20 +601,16 @@ impl Default for BuilderSettings {
 }
 
 impl Settings {
-    /// Get the default settings file path (~/.ironclaw/settings.json).
-    pub fn default_path() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".ironclaw")
-            .join("settings.json")
-    }
-
     /// Reconstruct Settings from a flat key-value map (as stored in the DB).
     ///
     /// Each key is a dotted path (e.g., "agent.name"), value is a JSONB value.
     /// Missing keys get their default value.
     pub fn from_db_map(map: &std::collections::HashMap<String, serde_json::Value>) -> Self {
-        // Start with defaults, then overlay each DB setting
+        // Start with defaults, then overlay each DB setting.
+        //
+        // The settings table stores both Settings struct fields and app-specific
+        // data (e.g. nearai.session_token). Skip keys that don't correspond to
+        // a known Settings path.
         let mut settings = Self::default();
 
         for (key, value) in map {
@@ -509,17 +619,23 @@ impl Settings {
                 serde_json::Value::String(s) => s.clone(),
                 serde_json::Value::Bool(b) => b.to_string(),
                 serde_json::Value::Number(n) => n.to_string(),
-                serde_json::Value::Null => "null".to_string(),
+                serde_json::Value::Null => continue, // null means default, skip
                 other => other.to_string(),
             };
 
-            if let Err(e) = settings.set(key, &value_str) {
-                tracing::warn!(
-                    "Failed to apply DB setting '{}' = '{}': {}",
-                    key,
-                    value_str,
-                    e
-                );
+            match settings.set(key, &value_str) {
+                Ok(()) => {}
+                // The settings table stores both Settings fields and app-specific
+                // data (e.g. nearai.session_token). Silently skip unknown paths.
+                Err(e) if e.starts_with("Path not found") => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to apply DB setting '{}' = '{}': {}",
+                        key,
+                        value_str,
+                        e
+                    );
+                }
             }
         }
 
@@ -540,48 +656,96 @@ impl Settings {
         map
     }
 
+    /// Get the default settings file path (~/.ironclaw/settings.json).
+    pub fn default_path() -> std::path::PathBuf {
+        ironclaw_base_dir().join("settings.json")
+    }
+
     /// Load settings from disk, returning default if not found.
     pub fn load() -> Self {
         Self::load_from(&Self::default_path())
     }
 
-    /// Load settings from a specific path.
-    pub fn load_from(path: &PathBuf) -> Self {
+    /// Load settings from a specific path (used by bootstrap legacy migration).
+    pub fn load_from(path: &std::path::Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
             Err(_) => Self::default(),
         }
     }
 
-    /// Save settings to disk.
-    pub fn save(&self) -> std::io::Result<()> {
-        self.save_to(&Self::default_path())
+    /// Default TOML config file path (~/.ironclaw/config.toml).
+    pub fn default_toml_path() -> PathBuf {
+        ironclaw_base_dir().join("config.toml")
     }
 
-    /// Save settings to a specific path.
-    pub fn save_to(&self, path: &PathBuf) -> std::io::Result<()> {
-        // Ensure parent directory exists
+    /// Load settings from a TOML file.
+    ///
+    /// Returns `None` if the file doesn't exist. Returns an error only
+    /// if the file exists but can't be parsed.
+    pub fn load_toml(path: &std::path::Path) -> Result<Option<Self>, String> {
+        let data = match std::fs::read_to_string(path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("failed to read {}: {}", path.display(), e)),
+        };
+
+        let settings: Self = toml::from_str(&data)
+            .map_err(|e| format!("invalid TOML in {}: {}", path.display(), e))?;
+        Ok(Some(settings))
+    }
+
+    /// Write a well-commented TOML config file with current settings.
+    pub fn save_toml(&self, path: &std::path::Path) -> Result<(), String> {
+        let raw = toml::to_string_pretty(self)
+            .map_err(|e| format!("failed to serialize settings: {}", e))?;
+
+        let content = format!(
+            "# IronClaw configuration file.\n\
+             #\n\
+             # Priority: env var > this file > database settings > defaults.\n\
+             # Uncomment and edit values to override defaults.\n\
+             # Run `ironclaw config init` to regenerate this file.\n\
+             #\n\
+             # Documentation: https://github.com/nearai/ironclaw\n\
+             \n\
+             {raw}"
+        );
+
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
         }
 
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-
-        std::fs::write(path, json)
+        std::fs::write(path, content)
+            .map_err(|e| format!("failed to write {}: {}", path.display(), e))
     }
 
-    /// Get the selected model, falling back to the provided default.
-    pub fn model_or(&self, default: &str) -> String {
-        self.selected_model
-            .clone()
-            .unwrap_or_else(|| default.to_string())
-    }
+    /// Merge values from `other` into `self`, preferring `other` for
+    /// fields that differ from the default.
+    ///
+    /// This enables layering: load DB/JSON settings as the base, then
+    /// overlay TOML values on top. Only fields that the TOML file
+    /// explicitly changed (i.e. differ from Default) are applied.
+    pub fn merge_from(&mut self, other: &Self) {
+        let default_json = match serde_json::to_value(Self::default()) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let other_json = match serde_json::to_value(other) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let mut self_json = match serde_json::to_value(&*self) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
 
-    /// Set the selected model and save.
-    pub fn set_model(&mut self, model: &str) -> std::io::Result<()> {
-        self.selected_model = Some(model.to_string());
-        self.save()
+        merge_non_default(&mut self_json, &other_json, &default_json);
+
+        if let Ok(merged) = serde_json::from_value(self_json) {
+            *self = merged;
+        }
     }
 
     /// Get a setting value by dotted path (e.g., "agent.max_parallel_jobs").
@@ -765,43 +929,54 @@ fn collect_settings(
     }
 }
 
+/// Recursively merge `other` into `target`, but only for fields where
+/// `other` differs from `defaults`. This means only explicitly-set values
+/// in the TOML file override the base settings.
+fn merge_non_default(
+    target: &mut serde_json::Value,
+    other: &serde_json::Value,
+    defaults: &serde_json::Value,
+) {
+    match (target, other, defaults) {
+        (
+            serde_json::Value::Object(t),
+            serde_json::Value::Object(o),
+            serde_json::Value::Object(d),
+        ) => {
+            for (key, other_val) in o {
+                let default_val = d.get(key).cloned().unwrap_or(serde_json::Value::Null);
+                if let Some(target_val) = t.get_mut(key) {
+                    merge_non_default(target_val, other_val, &default_val);
+                } else if other_val != &default_val {
+                    t.insert(key.clone(), other_val.clone());
+                }
+            }
+        }
+        (target, other, defaults) => {
+            if other != defaults {
+                *target = other.clone();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tempfile::tempdir;
+    use crate::settings::*;
 
     #[test]
-    fn test_settings_save_load() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("settings.json");
-
+    fn test_db_map_round_trip() {
         let settings = Settings {
             selected_model: Some("claude-3-5-sonnet-20241022".to_string()),
             ..Default::default()
         };
 
-        settings.save_to(&path).unwrap();
-
-        let loaded = Settings::load_from(&path);
+        let map = settings.to_db_map();
+        let restored = Settings::from_db_map(&map);
         assert_eq!(
-            loaded.selected_model,
+            restored.selected_model,
             Some("claude-3-5-sonnet-20241022".to_string())
         );
-    }
-
-    #[test]
-    fn test_model_or_default() {
-        let settings = Settings::default();
-        assert_eq!(
-            settings.model_or("default-model"),
-            "default-model".to_string()
-        );
-
-        let settings = Settings {
-            selected_model: Some("my-model".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(settings.model_or("default-model"), "my-model".to_string());
     }
 
     #[test]
@@ -874,16 +1049,13 @@ mod tests {
     }
 
     #[test]
-    fn test_telegram_owner_id_round_trip() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("settings.json");
-
+    fn test_telegram_owner_id_db_round_trip() {
         let mut settings = Settings::default();
         settings.channels.telegram_owner_id = Some(123456789);
-        settings.save_to(&path).unwrap();
 
-        let loaded = Settings::load_from(&path);
-        assert_eq!(loaded.channels.telegram_owner_id, Some(123456789));
+        let map = settings.to_db_map();
+        let restored = Settings::from_db_map(&map);
+        assert_eq!(restored.channels.telegram_owner_id, Some(123456789));
     }
 
     #[test]
@@ -899,5 +1071,531 @@ mod tests {
             .set("channels.telegram_owner_id", "987654321")
             .unwrap();
         assert_eq!(settings.channels.telegram_owner_id, Some(987654321));
+    }
+
+    #[test]
+    fn test_llm_backend_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let settings = Settings {
+            llm_backend: Some("anthropic".to_string()),
+            ollama_base_url: Some("http://localhost:11434".to_string()),
+            openai_compatible_base_url: Some("http://my-vllm:8000/v1".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string_pretty(&settings).unwrap();
+        std::fs::write(&path, json).unwrap();
+
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.llm_backend, Some("anthropic".to_string()));
+        assert_eq!(
+            loaded.ollama_base_url,
+            Some("http://localhost:11434".to_string())
+        );
+        assert_eq!(
+            loaded.openai_compatible_base_url,
+            Some("http://my-vllm:8000/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_openai_compatible_db_map_round_trip() {
+        let settings = Settings {
+            llm_backend: Some("openai_compatible".to_string()),
+            openai_compatible_base_url: Some("http://my-vllm:8000/v1".to_string()),
+            embeddings: EmbeddingsSettings {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let map = settings.to_db_map();
+        let restored = Settings::from_db_map(&map);
+
+        assert_eq!(
+            restored.llm_backend,
+            Some("openai_compatible".to_string()),
+            "llm_backend must survive DB round-trip"
+        );
+        assert_eq!(
+            restored.openai_compatible_base_url,
+            Some("http://my-vllm:8000/v1".to_string()),
+            "openai_compatible_base_url must survive DB round-trip"
+        );
+        assert!(
+            !restored.embeddings.enabled,
+            "embeddings.enabled=false must survive DB round-trip"
+        );
+    }
+
+    #[test]
+    fn toml_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut settings = Settings::default();
+        settings.agent.name = "toml-bot".to_string();
+        settings.heartbeat.enabled = true;
+        settings.heartbeat.interval_secs = 900;
+
+        settings.save_toml(&path).unwrap();
+        let loaded = Settings::load_toml(&path).unwrap().unwrap();
+
+        assert_eq!(loaded.agent.name, "toml-bot");
+        assert!(loaded.heartbeat.enabled);
+        assert_eq!(loaded.heartbeat.interval_secs, 900);
+    }
+
+    #[test]
+    fn toml_missing_file_returns_none() {
+        let result = Settings::load_toml(std::path::Path::new("/tmp/nonexistent_config.toml"));
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn toml_invalid_content_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "this is not valid toml [[[").unwrap();
+
+        let result = Settings::load_toml(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn toml_partial_config_uses_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.toml");
+
+        // Only set agent name, everything else should be default
+        std::fs::write(&path, "[agent]\nname = \"partial-bot\"\n").unwrap();
+
+        let loaded = Settings::load_toml(&path).unwrap().unwrap();
+        assert_eq!(loaded.agent.name, "partial-bot");
+        // Defaults preserved
+        assert_eq!(loaded.agent.max_parallel_jobs, 5);
+        assert!(!loaded.heartbeat.enabled);
+    }
+
+    #[test]
+    fn toml_header_comment_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        Settings::default().save_toml(&path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+
+        assert!(content.starts_with("# IronClaw configuration file."));
+        assert!(content.contains("[agent]"));
+        assert!(content.contains("[heartbeat]"));
+    }
+
+    #[test]
+    fn merge_only_overrides_non_default_values() {
+        let mut base = Settings::default();
+        base.agent.name = "from-db".to_string();
+        base.heartbeat.interval_secs = 600;
+
+        let mut toml_overlay = Settings::default();
+        toml_overlay.agent.name = "from-toml".to_string();
+
+        base.merge_from(&toml_overlay);
+
+        assert_eq!(base.agent.name, "from-toml");
+        assert_eq!(base.heartbeat.interval_secs, 600);
+    }
+
+    #[test]
+    fn merge_preserves_base_when_overlay_is_default() {
+        let mut base = Settings::default();
+        base.agent.name = "custom-name".to_string();
+        base.heartbeat.enabled = true;
+
+        let overlay = Settings::default();
+        base.merge_from(&overlay);
+
+        assert_eq!(base.agent.name, "custom-name");
+        assert!(base.heartbeat.enabled);
+    }
+
+    #[test]
+    fn toml_creates_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("deep").join("config.toml");
+
+        Settings::default().save_toml(&path).unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn default_toml_path_under_ironclaw() {
+        let path = Settings::default_toml_path();
+        assert!(path.to_string_lossy().contains(".ironclaw"));
+        assert!(path.to_string_lossy().ends_with("config.toml"));
+    }
+
+    #[test]
+    fn tunnel_settings_round_trip() {
+        let settings = Settings {
+            tunnel: TunnelSettings {
+                provider: Some("ngrok".to_string()),
+                ngrok_token: Some("tok_abc123".to_string()),
+                ngrok_domain: Some("my.ngrok.dev".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // JSON round-trip
+        let json = serde_json::to_string(&settings).unwrap();
+        let restored: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.tunnel.provider, Some("ngrok".to_string()));
+        assert_eq!(restored.tunnel.ngrok_token, Some("tok_abc123".to_string()));
+        assert_eq!(
+            restored.tunnel.ngrok_domain,
+            Some("my.ngrok.dev".to_string())
+        );
+        assert!(restored.tunnel.public_url.is_none());
+
+        // DB map round-trip
+        let map = settings.to_db_map();
+        let from_db = Settings::from_db_map(&map);
+        assert_eq!(from_db.tunnel.provider, Some("ngrok".to_string()));
+        assert_eq!(from_db.tunnel.ngrok_token, Some("tok_abc123".to_string()));
+
+        // get/set round-trip
+        let mut s = Settings::default();
+        s.set("tunnel.provider", "cloudflare").unwrap();
+        s.set("tunnel.cf_token", "cf_tok_xyz").unwrap();
+        s.set("tunnel.ts_funnel", "true").unwrap();
+        assert_eq!(s.tunnel.provider, Some("cloudflare".to_string()));
+        assert_eq!(s.tunnel.cf_token, Some("cf_tok_xyz".to_string()));
+        assert!(s.tunnel.ts_funnel);
+    }
+
+    /// Simulates the wizard recovery scenario:
+    ///
+    /// 1. A prior partial run saved steps 1-4 to the DB
+    /// 2. User re-runs the wizard, Step 1 sets a new database_url
+    /// 3. Prior settings are loaded from the DB
+    /// 4. Step 1's fresh choices must win over stale DB values
+    ///
+    /// This tests the ordering: load DB → merge_from(step1_overrides).
+    #[test]
+    fn wizard_recovery_step1_overrides_stale_db() {
+        // Simulate prior partial run (steps 1-4 completed):
+        let prior_run = Settings {
+            database_backend: Some("postgres".to_string()),
+            database_url: Some("postgres://old-host/ironclaw".to_string()),
+            llm_backend: Some("anthropic".to_string()),
+            selected_model: Some("claude-sonnet-4-5".to_string()),
+            embeddings: EmbeddingsSettings {
+                enabled: true,
+                provider: "openai".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Save to DB and reload (simulates persistence round-trip)
+        let db_map = prior_run.to_db_map();
+        let from_db = Settings::from_db_map(&db_map);
+
+        // Step 1 of the new wizard run: user enters a NEW database_url
+        let step1_settings = Settings {
+            database_backend: Some("postgres".to_string()),
+            database_url: Some("postgres://new-host/ironclaw".to_string()),
+            ..Settings::default()
+        };
+
+        // Wizard flow: load DB → merge_from(step1_overrides)
+        let mut current = step1_settings.clone();
+        // try_load_existing_settings: merge DB into current
+        current.merge_from(&from_db);
+        // Re-apply Step 1 choices on top
+        current.merge_from(&step1_settings);
+
+        // Step 1's fresh database_url wins over stale DB value
+        assert_eq!(
+            current.database_url,
+            Some("postgres://new-host/ironclaw".to_string()),
+            "Step 1 fresh choice must override stale DB value"
+        );
+
+        // Prior run's steps 2-4 settings are preserved
+        assert_eq!(
+            current.llm_backend,
+            Some("anthropic".to_string()),
+            "Prior run's LLM backend must be recovered"
+        );
+        assert_eq!(
+            current.selected_model,
+            Some("claude-sonnet-4-5".to_string()),
+            "Prior run's model must be recovered"
+        );
+        assert!(
+            current.embeddings.enabled,
+            "Prior run's embeddings setting must be recovered"
+        );
+    }
+
+    /// Verifies that persisting defaults doesn't clobber prior settings
+    /// when the merge ordering is correct.
+    #[test]
+    fn wizard_recovery_defaults_dont_clobber_prior() {
+        // Prior run saved non-default settings
+        let prior_run = Settings {
+            llm_backend: Some("openai".to_string()),
+            selected_model: Some("gpt-4o".to_string()),
+            heartbeat: HeartbeatSettings {
+                enabled: true,
+                interval_secs: 900,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let db_map = prior_run.to_db_map();
+        let from_db = Settings::from_db_map(&db_map);
+
+        // New wizard run: Step 1 only sets DB fields (rest is default)
+        let step1 = Settings {
+            database_backend: Some("libsql".to_string()),
+            ..Default::default()
+        };
+
+        // Correct merge ordering
+        let mut current = step1.clone();
+        current.merge_from(&from_db);
+        current.merge_from(&step1);
+
+        // Prior settings preserved (Step 1 doesn't touch these)
+        assert_eq!(current.llm_backend, Some("openai".to_string()));
+        assert_eq!(current.selected_model, Some("gpt-4o".to_string()));
+        assert!(current.heartbeat.enabled);
+        assert_eq!(current.heartbeat.interval_secs, 900);
+
+        // Step 1's choice applied
+        assert_eq!(current.database_backend, Some("libsql".to_string()));
+    }
+
+    // === QA Plan P1 - 1.2: Config round-trip tests ===
+
+    #[test]
+    fn comprehensive_db_map_round_trip() {
+        // Set a representative value in EVERY section and verify survival
+        let settings = Settings {
+            onboard_completed: true,
+            database_backend: Some("libsql".to_string()),
+            database_url: Some("postgres://host/db".to_string()),
+            llm_backend: Some("anthropic".to_string()),
+            selected_model: Some("claude-sonnet-4-5".to_string()),
+            openai_compatible_base_url: Some("http://vllm:8000/v1".to_string()),
+            secrets_master_key_source: KeySource::Keychain,
+            embeddings: EmbeddingsSettings {
+                enabled: true,
+                provider: "nearai".to_string(),
+                model: "text-embedding-3-large".to_string(),
+            },
+            tunnel: TunnelSettings {
+                provider: Some("ngrok".to_string()),
+                ngrok_token: Some("tok_xxx".to_string()),
+                ..Default::default()
+            },
+            channels: ChannelSettings {
+                http_enabled: true,
+                http_port: Some(9090),
+                telegram_owner_id: Some(12345),
+                ..Default::default()
+            },
+            heartbeat: HeartbeatSettings {
+                enabled: true,
+                interval_secs: 900,
+                ..Default::default()
+            },
+            agent: AgentSettings {
+                name: "my-bot".to_string(),
+                max_parallel_jobs: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let map = settings.to_db_map();
+        let restored = Settings::from_db_map(&map);
+
+        assert!(restored.onboard_completed, "onboard_completed lost");
+        assert_eq!(
+            restored.database_backend,
+            Some("libsql".to_string()),
+            "database_backend lost"
+        );
+        assert_eq!(
+            restored.database_url,
+            Some("postgres://host/db".to_string()),
+            "database_url lost"
+        );
+        assert_eq!(
+            restored.llm_backend,
+            Some("anthropic".to_string()),
+            "llm_backend lost"
+        );
+        assert_eq!(
+            restored.selected_model,
+            Some("claude-sonnet-4-5".to_string()),
+            "selected_model lost"
+        );
+        assert_eq!(
+            restored.openai_compatible_base_url,
+            Some("http://vllm:8000/v1".to_string()),
+            "openai_compatible_base_url lost"
+        );
+        assert_eq!(
+            restored.secrets_master_key_source,
+            KeySource::Keychain,
+            "key_source lost"
+        );
+        assert!(restored.embeddings.enabled, "embeddings.enabled lost");
+        assert_eq!(
+            restored.embeddings.provider, "nearai",
+            "embeddings.provider lost"
+        );
+        assert_eq!(
+            restored.embeddings.model, "text-embedding-3-large",
+            "embeddings.model lost"
+        );
+        assert_eq!(
+            restored.tunnel.provider,
+            Some("ngrok".to_string()),
+            "tunnel.provider lost"
+        );
+        assert!(restored.channels.http_enabled, "http_enabled lost");
+        assert_eq!(restored.channels.http_port, Some(9090), "http_port lost");
+        assert_eq!(
+            restored.channels.telegram_owner_id,
+            Some(12345),
+            "telegram_owner_id lost"
+        );
+        assert!(restored.heartbeat.enabled, "heartbeat.enabled lost");
+        assert_eq!(
+            restored.heartbeat.interval_secs, 900,
+            "heartbeat.interval_secs lost"
+        );
+        assert_eq!(restored.agent.name, "my-bot", "agent.name lost");
+        assert_eq!(
+            restored.agent.max_parallel_jobs, 10,
+            "agent.max_parallel_jobs lost"
+        );
+    }
+
+    #[test]
+    fn toml_json_db_all_agree() {
+        // A config that goes through all three formats should produce the same values
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("config.toml");
+        let json_path = dir.path().join("settings.json");
+
+        let original = Settings {
+            llm_backend: Some("ollama".to_string()),
+            selected_model: Some("llama3".to_string()),
+            heartbeat: HeartbeatSettings {
+                enabled: true,
+                interval_secs: 600,
+                ..Default::default()
+            },
+            agent: AgentSettings {
+                name: "round-trip-bot".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // TOML round-trip
+        original.save_toml(&toml_path).unwrap();
+        let from_toml = Settings::load_toml(&toml_path).unwrap().unwrap();
+
+        // JSON round-trip
+        let json = serde_json::to_string_pretty(&original).unwrap();
+        std::fs::write(&json_path, &json).unwrap();
+        let from_json = Settings::load_from(&json_path);
+
+        // DB map round-trip
+        let db_map = original.to_db_map();
+        let from_db = Settings::from_db_map(&db_map);
+
+        // All three should agree on key values
+        for (label, loaded) in [("TOML", &from_toml), ("JSON", &from_json), ("DB", &from_db)] {
+            assert_eq!(
+                loaded.llm_backend,
+                Some("ollama".to_string()),
+                "{label}: llm_backend"
+            );
+            assert_eq!(
+                loaded.selected_model,
+                Some("llama3".to_string()),
+                "{label}: selected_model"
+            );
+            assert!(loaded.heartbeat.enabled, "{label}: heartbeat.enabled");
+            assert_eq!(
+                loaded.heartbeat.interval_secs, 600,
+                "{label}: heartbeat.interval_secs"
+            );
+            assert_eq!(loaded.agent.name, "round-trip-bot", "{label}: agent.name");
+        }
+    }
+
+    #[test]
+    fn set_get_round_trip_all_documented_paths() {
+        let mut settings = Settings::default();
+
+        // Test set + get for each documented settings path
+        let test_cases: Vec<(&str, &str)> = vec![
+            ("agent.name", "test-agent"),
+            ("agent.max_parallel_jobs", "8"),
+            ("heartbeat.enabled", "true"),
+            ("heartbeat.interval_secs", "300"),
+            ("channels.http_enabled", "true"),
+            ("channels.http_port", "8081"),
+        ];
+
+        for (path, value) in &test_cases {
+            settings
+                .set(path, value)
+                .unwrap_or_else(|e| panic!("set({path}, {value}) failed: {e}"));
+            let got = settings
+                .get(path)
+                .unwrap_or_else(|| panic!("get({path}) returned None after set"));
+            assert_eq!(&got, value, "set/get round-trip failed for path '{path}'");
+        }
+    }
+
+    #[test]
+    fn option_string_fields_survive_db_round_trip_as_null() {
+        // When an Option<String> field is None, it should be stored as null
+        // and come back as None, not silently become Some("")
+        let settings = Settings {
+            database_url: None,
+            llm_backend: None,
+            selected_model: None,
+            openai_compatible_base_url: None,
+            ..Default::default()
+        };
+
+        let map = settings.to_db_map();
+        let restored = Settings::from_db_map(&map);
+
+        assert_eq!(
+            restored.database_url, None,
+            "None database_url should stay None"
+        );
+        assert_eq!(
+            restored.llm_backend, None,
+            "None llm_backend should stay None"
+        );
+        assert_eq!(
+            restored.selected_model, None,
+            "None selected_model should stay None"
+        );
     }
 }

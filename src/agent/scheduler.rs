@@ -12,8 +12,9 @@ use crate::agent::task::{Task, TaskContext, TaskOutput};
 use crate::agent::worker::{Worker, WorkerDeps};
 use crate::config::AgentConfig;
 use crate::context::{ContextManager, JobContext, JobState};
+use crate::db::Database;
 use crate::error::{Error, JobError};
-use crate::history::Store;
+use crate::hooks::HookRegistry;
 use crate::llm::LlmProvider;
 use crate::safety::SafetyLayer;
 use crate::tools::ToolRegistry;
@@ -48,7 +49,8 @@ pub struct Scheduler {
     llm: Arc<dyn LlmProvider>,
     safety: Arc<SafetyLayer>,
     tools: Arc<ToolRegistry>,
-    store: Option<Arc<Store>>,
+    store: Option<Arc<dyn Database>>,
+    hooks: Arc<HookRegistry>,
     /// Running jobs (main LLM-driven jobs).
     jobs: Arc<RwLock<HashMap<Uuid, ScheduledJob>>>,
     /// Running sub-tasks (tool executions, background tasks).
@@ -63,7 +65,8 @@ impl Scheduler {
         llm: Arc<dyn LlmProvider>,
         safety: Arc<SafetyLayer>,
         tools: Arc<ToolRegistry>,
-        store: Option<Arc<Store>>,
+        store: Option<Arc<dyn Database>>,
+        hooks: Arc<HookRegistry>,
     ) -> Self {
         Self {
             config,
@@ -72,70 +75,118 @@ impl Scheduler {
             safety,
             tools,
             store,
+            hooks,
             jobs: Arc::new(RwLock::new(HashMap::new())),
             subtasks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
+    /// Create, persist, and schedule a job in one shot.
+    ///
+    /// This is the preferred entry point for dispatching new jobs. It:
+    /// 1. Creates the job context via `ContextManager`
+    /// 2. Optionally applies metadata (e.g. `max_iterations`)
+    /// 3. Persists the job to the database (so FK references from
+    ///    `job_actions` / `llm_calls` work immediately)
+    /// 4. Schedules the job for worker execution
+    ///
+    /// Returns the new job ID.
+    pub async fn dispatch_job(
+        &self,
+        user_id: &str,
+        title: &str,
+        description: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<Uuid, JobError> {
+        let job_id = self
+            .context_manager
+            .create_job_for_user(user_id, title, description)
+            .await?;
+
+        // Apply metadata if provided
+        if let Some(meta) = metadata {
+            self.context_manager
+                .update_context(job_id, |ctx| {
+                    ctx.metadata = meta;
+                })
+                .await?;
+        }
+
+        // Persist to DB before scheduling so the worker's FK references are valid
+        if let Some(ref store) = self.store {
+            let ctx = self.context_manager.get_context(job_id).await?;
+            store.save_job(&ctx).await.map_err(|e| JobError::Failed {
+                id: job_id,
+                reason: format!("failed to persist job: {e}"),
+            })?;
+        }
+
+        self.schedule(job_id).await?;
+        Ok(job_id)
+    }
+
     /// Schedule a job for execution.
     pub async fn schedule(&self, job_id: Uuid) -> Result<(), JobError> {
-        // Check if already scheduled
-        if self.jobs.read().await.contains_key(&job_id) {
-            return Ok(());
-        }
+        // Hold write lock for the entire check-insert sequence to prevent
+        // TOCTOU races where two concurrent calls both pass the checks.
+        {
+            let mut jobs = self.jobs.write().await;
 
-        // Check capacity
-        let current_count = self.jobs.read().await.len();
-        if current_count >= self.config.max_parallel_jobs {
-            return Err(JobError::MaxJobsExceeded {
-                max: self.config.max_parallel_jobs,
-            });
-        }
-
-        // Transition job to in_progress
-        self.context_manager
-            .update_context(job_id, |ctx| {
-                ctx.transition_to(
-                    JobState::InProgress,
-                    Some("Scheduled for execution".to_string()),
-                )
-            })
-            .await?
-            .map_err(|s| JobError::ContextError {
-                id: job_id,
-                reason: s,
-            })?;
-
-        // Create worker channel
-        let (tx, rx) = mpsc::channel(16);
-
-        // Create worker with shared dependencies
-        let deps = WorkerDeps {
-            context_manager: self.context_manager.clone(),
-            llm: self.llm.clone(),
-            safety: self.safety.clone(),
-            tools: self.tools.clone(),
-            store: self.store.clone(),
-            timeout: self.config.job_timeout,
-            use_planning: self.config.use_planning,
-        };
-        let worker = Worker::new(job_id, deps);
-
-        // Spawn worker task
-        let handle = tokio::spawn(async move {
-            if let Err(e) = worker.run(rx).await {
-                tracing::error!("Worker for job {} failed: {}", job_id, e);
+            if jobs.contains_key(&job_id) {
+                return Ok(());
             }
-        });
 
-        // Start the worker
-        let _ = tx.send(WorkerMessage::Start).await;
+            if jobs.len() >= self.config.max_parallel_jobs {
+                return Err(JobError::MaxJobsExceeded {
+                    max: self.config.max_parallel_jobs,
+                });
+            }
 
-        // Store the scheduled job
-        self.jobs
-            .write()
-            .await
-            .insert(job_id, ScheduledJob { handle, tx });
+            // Transition job to in_progress
+            self.context_manager
+                .update_context(job_id, |ctx| {
+                    ctx.transition_to(
+                        JobState::InProgress,
+                        Some("Scheduled for execution".to_string()),
+                    )
+                })
+                .await?
+                .map_err(|s| JobError::ContextError {
+                    id: job_id,
+                    reason: s,
+                })?;
+
+            // Create worker channel
+            let (tx, rx) = mpsc::channel(16);
+
+            // Create worker with shared dependencies
+            let deps = WorkerDeps {
+                context_manager: self.context_manager.clone(),
+                llm: self.llm.clone(),
+                safety: self.safety.clone(),
+                tools: self.tools.clone(),
+                store: self.store.clone(),
+                hooks: self.hooks.clone(),
+                timeout: self.config.job_timeout,
+                use_planning: self.config.use_planning,
+            };
+            let worker = Worker::new(job_id, deps);
+
+            // Spawn worker task
+            let handle = tokio::spawn(async move {
+                if let Err(e) = worker.run(rx).await {
+                    tracing::error!("Worker for job {} failed: {}", job_id, e);
+                }
+            });
+
+            // Start the worker
+            if tx.send(WorkerMessage::Start).await.is_err() {
+                tracing::error!(job_id = %job_id, "Worker died before receiving Start message");
+            }
+
+            // Insert while still holding the write lock
+            jobs.insert(job_id, ScheduledJob { handle, tx });
+        }
 
         // Cleanup task for this job to avoid capacity leaks
         let jobs = Arc::clone(&self.jobs);
@@ -350,7 +401,7 @@ impl Scheduler {
             .into());
         }
 
-        if tool.requires_approval() {
+        if tool.requires_approval(&params).is_required() {
             return Err(crate::error::ToolError::AuthRequired {
                 name: tool_name.to_string(),
             }
@@ -413,10 +464,16 @@ impl Scheduler {
             // Update job state
             self.context_manager
                 .update_context(job_id, |ctx| {
-                    let _ = ctx.transition_to(
+                    if let Err(e) = ctx.transition_to(
                         JobState::Cancelled,
                         Some("Stopped by scheduler".to_string()),
-                    );
+                    ) {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            error = %e,
+                            "Failed to transition job to Cancelled state"
+                        );
+                    }
                 })
                 .await?;
 

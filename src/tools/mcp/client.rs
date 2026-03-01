@@ -18,7 +18,7 @@ use crate::tools::mcp::protocol::{
     CallToolResult, InitializeResult, ListToolsResult, McpRequest, McpResponse, McpTool,
 };
 use crate::tools::mcp::session::McpSessionManager;
-use crate::tools::tool::{Tool, ToolError, ToolOutput};
+use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput};
 
 /// MCP client for communicating with MCP servers.
 ///
@@ -184,44 +184,46 @@ impl McpClient {
             }
 
             // Add Mcp-Session-Id header if we have a session
-            if let Some(ref session_manager) = self.session_manager {
-                if let Some(session_id) = session_manager.get_session_id(&self.server_name).await {
-                    req_builder = req_builder.header("Mcp-Session-Id", session_id);
-                }
+            if let Some(ref session_manager) = self.session_manager
+                && let Some(session_id) = session_manager.get_session_id(&self.server_name).await
+            {
+                req_builder = req_builder.header("Mcp-Session-Id", session_id);
             }
 
-            let response = req_builder
-                .send()
-                .await
-                .map_err(|e| ToolError::ExternalService(format!("MCP request failed: {}", e)))?;
+            let response = req_builder.send().await.map_err(|e| {
+                let mut chain = format!("MCP request failed: {}", e);
+                let mut source = std::error::Error::source(&e);
+                while let Some(cause) = source {
+                    chain.push_str(&format!(" -> {}", cause));
+                    source = cause.source();
+                }
+                ToolError::ExternalService(chain)
+            })?;
 
             // Check for 401 Unauthorized - try to refresh token on first attempt
             if response.status() == reqwest::StatusCode::UNAUTHORIZED {
                 if attempt == 0 {
                     // Try to refresh the token
-                    if let Some(ref secrets) = self.secrets {
-                        if let Some(ref config) = self.server_config {
-                            tracing::debug!(
-                                "MCP token expired, attempting refresh for '{}'",
-                                self.server_name
-                            );
-                            match refresh_access_token(config, secrets, &self.user_id).await {
-                                Ok(_) => {
-                                    tracing::info!(
-                                        "MCP token refreshed for '{}'",
-                                        self.server_name
-                                    );
-                                    // Continue to next iteration to retry with new token
-                                    continue;
-                                }
-                                Err(e) => {
-                                    tracing::debug!(
-                                        "Token refresh failed for '{}': {}",
-                                        self.server_name,
-                                        e
-                                    );
-                                    // Fall through to return auth error
-                                }
+                    if let Some(ref secrets) = self.secrets
+                        && let Some(ref config) = self.server_config
+                    {
+                        tracing::debug!(
+                            "MCP token expired, attempting refresh for '{}'",
+                            self.server_name
+                        );
+                        match refresh_access_token(config, secrets, &self.user_id).await {
+                            Ok(_) => {
+                                tracing::info!("MCP token refreshed for '{}'", self.server_name);
+                                // Continue to next iteration to retry with new token
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "Token refresh failed for '{}': {}",
+                                    self.server_name,
+                                    e
+                                );
+                                // Fall through to return auth error
                             }
                         }
                     }
@@ -245,16 +247,15 @@ impl McpClient {
     /// Parse the HTTP response into an MCP response.
     async fn parse_response(&self, response: reqwest::Response) -> Result<McpResponse, ToolError> {
         // Extract session ID from response header
-        if let Some(ref session_manager) = self.session_manager {
-            if let Some(session_id) = response
+        if let Some(ref session_manager) = self.session_manager
+            && let Some(session_id) = response
                 .headers()
                 .get("Mcp-Session-Id")
                 .and_then(|v| v.to_str().ok())
-            {
-                session_manager
-                    .update_session_id(&self.server_name, Some(session_id.to_string()))
-                    .await;
-            }
+        {
+            session_manager
+                .update_session_id(&self.server_name, Some(session_id.to_string()))
+                .await;
         }
 
         if !response.status().is_success() {
@@ -316,11 +317,11 @@ impl McpClient {
     /// This should be called once per session to establish capabilities.
     pub async fn initialize(&self) -> Result<InitializeResult, ToolError> {
         // Check if already initialized
-        if let Some(ref session_manager) = self.session_manager {
-            if session_manager.is_initialized(&self.server_name).await {
-                // Return cached/default capabilities
-                return Ok(InitializeResult::default());
-            }
+        if let Some(ref session_manager) = self.session_manager
+            && session_manager.is_initialized(&self.server_name).await
+        {
+            // Return cached/default capabilities
+            return Ok(InitializeResult::default());
         }
 
         // Ensure we have a session
@@ -537,9 +538,13 @@ impl Tool for McpToolWrapper {
         true // MCP tools are external, always sanitize
     }
 
-    fn requires_approval(&self) -> bool {
-        // Check the destructive_hint annotation from the MCP server
-        self.tool.requires_approval()
+    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+        // Delegate to the MCP protocol type's own requires_approval() bool method
+        if self.tool.requires_approval() {
+            ApprovalRequirement::UnlessAutoApproved
+        } else {
+            ApprovalRequirement::Never
+        }
     }
 }
 

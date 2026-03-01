@@ -55,6 +55,10 @@ pub struct ToolCallInfo {
     pub name: String,
     pub has_result: bool,
     pub has_error: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,6 +71,21 @@ pub struct HistoryResponse {
     /// Cursor for the next page (ISO8601 timestamp of the oldest message returned).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest_timestamp: Option<String>,
+    /// Pending tool approval that needs user action (re-rendered on thread switch).
+    ///
+    /// Only populated from in-memory state; not persisted to DB.
+    /// Server restart clears pending approvals.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_approval: Option<PendingApprovalInfo>,
+}
+
+/// Lightweight DTO for a pending tool approval (excludes context_messages).
+#[derive(Debug, Serialize)]
+pub struct PendingApprovalInfo {
+    pub request_id: String,
+    pub tool_name: String,
+    pub description: String,
+    pub parameters: String,
 }
 
 // --- Approval ---
@@ -137,6 +156,8 @@ pub enum SseEvent {
         tool_name: String,
         description: String,
         parameters: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
     },
     #[serde(rename = "auth_required")]
     AuthRequired {
@@ -190,6 +211,15 @@ pub enum SseEvent {
         status: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
+    },
+
+    /// Extension activation status change (WASM channels).
+    #[serde(rename = "extension_status")]
+    ExtensionStatus {
+        extension_name: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
 }
 
@@ -337,6 +367,8 @@ pub struct TransitionInfo {
 #[derive(Debug, Serialize)]
 pub struct ExtensionInfo {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub kind: String,
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -344,6 +376,15 @@ pub struct ExtensionInfo {
     pub authenticated: bool,
     pub active: bool,
     pub tools: Vec<String>,
+    /// Whether this extension has configurable secrets (setup schema).
+    #[serde(default)]
+    pub needs_setup: bool,
+    /// WASM channel activation status: "installed", "configured", "active", "failed".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activation_status: Option<String>,
+    /// Human-readable error when activation_status is "failed".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activation_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -369,6 +410,31 @@ pub struct InstallExtensionRequest {
     pub kind: Option<String>,
 }
 
+// --- Extension Setup ---
+
+#[derive(Debug, Serialize)]
+pub struct ExtensionSetupResponse {
+    pub name: String,
+    pub kind: String,
+    pub secrets: Vec<SecretFieldInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SecretFieldInfo {
+    pub name: String,
+    pub prompt: String,
+    pub optional: bool,
+    /// Whether this secret is already stored.
+    pub provided: bool,
+    /// Whether the secret will be auto-generated if left empty.
+    pub auto_generate: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExtensionSetupRequest {
+    pub secrets: std::collections::HashMap<String, String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ActionResponse {
     pub success: bool,
@@ -382,6 +448,12 @@ pub struct ActionResponse {
     /// Instructions for manual token entry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// Whether the channel was successfully activated after setup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activated: Option<bool>,
+    /// Whether a gateway restart is needed (activation failed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs_restart: Option<bool>,
 }
 
 impl ActionResponse {
@@ -392,6 +464,8 @@ impl ActionResponse {
             auth_url: None,
             awaiting_token: None,
             instructions: None,
+            activated: None,
+            needs_restart: None,
         }
     }
 
@@ -402,8 +476,94 @@ impl ActionResponse {
             auth_url: None,
             awaiting_token: None,
             instructions: None,
+            activated: None,
+            needs_restart: None,
         }
     }
+}
+
+// --- Registry ---
+
+#[derive(Debug, Serialize)]
+pub struct RegistryEntryInfo {
+    pub name: String,
+    pub display_name: String,
+    pub kind: String,
+    pub description: String,
+    pub keywords: Vec<String>,
+    pub installed: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegistrySearchResponse {
+    pub entries: Vec<RegistryEntryInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RegistrySearchQuery {
+    pub query: Option<String>,
+}
+
+// --- Pairing ---
+
+#[derive(Debug, Serialize)]
+pub struct PairingListResponse {
+    pub channel: String,
+    pub requests: Vec<PairingRequestInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PairingRequestInfo {
+    pub code: String,
+    pub sender_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PairingApproveRequest {
+    pub code: String,
+}
+
+// --- Skills ---
+
+#[derive(Debug, Serialize)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub trust: String,
+    pub source: String,
+    pub keywords: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkillListResponse {
+    pub skills: Vec<SkillInfo>,
+    pub count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SkillSearchRequest {
+    pub query: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkillSearchResponse {
+    pub catalog: Vec<serde_json::Value>,
+    pub installed: Vec<SkillInfo>,
+    pub registry_url: String,
+    /// If the catalog registry was unreachable or errored, a human-readable message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SkillInstallRequest {
+    pub name: String,
+    pub url: Option<String>,
+    pub content: Option<String>,
 }
 
 // --- Auth Token ---
@@ -498,6 +658,7 @@ impl WsServerMessage {
             SseEvent::JobToolResult { .. } => "job_tool_result",
             SseEvent::JobStatus { .. } => "job_status",
             SseEvent::JobResult { .. } => "job_result",
+            SseEvent::ExtensionStatus { .. } => "extension_status",
         };
         let data = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
         WsServerMessage::Event {
@@ -748,12 +909,14 @@ mod tests {
             tool_name: "shell".to_string(),
             description: "Run ls".to_string(),
             parameters: "{}".to_string(),
+            thread_id: Some("t1".to_string()),
         };
         let ws = WsServerMessage::from_sse_event(&sse);
         match ws {
             WsServerMessage::Event { event_type, data } => {
                 assert_eq!(event_type, "approval_needed");
                 assert_eq!(data["tool_name"], "shell");
+                assert_eq!(data["thread_id"], "t1");
             }
             _ => panic!("Expected Event variant"),
         }

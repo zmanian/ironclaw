@@ -5,6 +5,7 @@
 //! Streams real-time events (message, tool_use, tool_result, result) through
 //! the orchestrator's job event pipeline for UI visibility.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,6 +52,11 @@ pub struct WorkerRuntime {
     llm: Arc<dyn LlmProvider>,
     safety: Arc<SafetyLayer>,
     tools: Arc<ToolRegistry>,
+    /// Credentials fetched from the orchestrator, injected into child processes
+    /// via `Command::envs()` rather than mutating the global process environment.
+    ///
+    /// Wrapped in `Arc` to avoid deep-cloning the map on every tool invocation.
+    extra_env: Arc<HashMap<String, String>>,
 }
 
 impl WorkerRuntime {
@@ -83,11 +89,12 @@ impl WorkerRuntime {
             llm,
             safety,
             tools,
+            extra_env: Arc::new(HashMap::new()),
         })
     }
 
     /// Run the worker until the job is complete or an error occurs.
-    pub async fn run(self) -> Result<(), WorkerError> {
+    pub async fn run(mut self) -> Result<(), WorkerError> {
         tracing::info!("Worker starting for job {}", self.config.job_id);
 
         // Fetch job description from orchestrator
@@ -98,6 +105,23 @@ impl WorkerRuntime {
             job.title,
             truncate(&job.description, 100)
         );
+
+        // Fetch credentials and store them for injection into child processes
+        // via Command::envs() (avoids unsafe std::env::set_var in multi-threaded runtime).
+        let credentials = self.client.fetch_credentials().await?;
+        {
+            let mut env_map = HashMap::new();
+            for cred in &credentials {
+                env_map.insert(cred.env_var.clone(), cred.value.clone());
+            }
+            self.extra_env = Arc::new(env_map);
+        }
+        if !credentials.is_empty() {
+            tracing::info!(
+                "Fetched {} credential(s) for child process injection",
+                credentials.len()
+            );
+        }
 
         // Report that we're starting
         self.client
@@ -238,7 +262,7 @@ Work independently to complete this job. Report when done."#,
                             reason: format!("respond_with_tools failed: {}", e),
                         })?;
 
-                match respond_result {
+                match respond_result.result {
                     RespondResult::Text(response) => {
                         self.post_event(
                             "message",
@@ -249,11 +273,7 @@ Work independently to complete this job. Report when done."#,
                         )
                         .await;
 
-                        let response_lower = response.to_lowercase();
-                        if response_lower.contains("complete")
-                            || response_lower.contains("finished")
-                            || response_lower.contains("done")
-                        {
+                        if crate::util::llm_signals_completion(&response) {
                             if last_output.is_empty() {
                                 last_output = response.clone();
                             }
@@ -317,6 +337,7 @@ Work independently to complete this job. Report when done."#,
                                 parameters: tc.arguments.clone(),
                                 reasoning: String::new(),
                                 alternatives: vec![],
+                                tool_call_id: tc.id.clone(),
                             };
                             self.process_result(reason_ctx, &selection, result);
                         }
@@ -381,7 +402,10 @@ Work independently to complete this job. Report when done."#,
             None => return Err(format!("tool '{}' not found", tool_name)),
         };
 
-        let ctx = JobContext::default();
+        let ctx = JobContext {
+            extra_env: self.extra_env.clone(),
+            ..Default::default()
+        };
 
         // Validate params
         let validation = self.safety.validator().validate_tool_params(params);
@@ -426,17 +450,21 @@ Work independently to complete this job. Report when done."#,
                 );
 
                 reason_ctx.messages.push(ChatMessage::tool_result(
-                    "tool_call_id",
+                    &selection.tool_call_id,
                     &selection.tool_name,
                     wrapped,
                 ));
 
-                output.contains("TASK_COMPLETE") || output.contains("JOB_DONE")
+                // Tool output should never signal job completion. Only the LLM's
+                // natural language response should decide when a job is done. A
+                // tool could return text containing "TASK_COMPLETE" in its output
+                // (e.g. from file contents) and trigger a false positive.
+                false
             }
             Err(e) => {
                 tracing::warn!("Tool {} failed: {}", selection.tool_name, e);
                 reason_ctx.messages.push(ChatMessage::tool_result(
-                    "tool_call_id",
+                    &selection.tool_call_id,
                     &selection.tool_name,
                     format!("Error: {}", e),
                 ));
@@ -486,6 +514,36 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        let end = crate::util::floor_char_boundary(s, max);
+        format!("{}...", &s[..end])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::worker::runtime::truncate;
+
+    #[test]
+    fn test_truncate_within_limit() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_at_limit() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_beyond_limit() {
+        let result = truncate("hello world", 5);
+        assert_eq!(result, "hello...");
+    }
+
+    #[test]
+    fn test_truncate_multibyte_safe() {
+        // "é" is 2 bytes in UTF-8; slicing at byte 1 would panic without safety
+        let result = truncate("é is fancy", 1);
+        // Should truncate to 0 chars (can't fit "é" in 1 byte)
+        assert_eq!(result, "...");
     }
 }

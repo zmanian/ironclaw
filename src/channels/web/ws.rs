@@ -71,8 +71,17 @@ pub async fn handle_ws_connection(socket: WebSocket, state: Arc<GatewayState>) {
     }
     let tracker_for_drop = state.ws_tracker.clone();
 
-    // Subscribe to broadcast events (same source as SSE)
-    let mut event_stream = Box::pin(state.sse.subscribe_raw());
+    // Subscribe to broadcast events (same source as SSE).
+    // Reject if we've hit the connection limit.
+    let Some(raw_stream) = state.sse.subscribe_raw() else {
+        tracing::warn!("WebSocket rejected: too many connections");
+        // Decrement the WS tracker we already incremented above.
+        if let Some(ref tracker) = tracker_for_drop {
+            tracker.decrement();
+        }
+        return;
+    };
+    let mut event_stream = Box::pin(raw_stream);
 
     // Channel for the sender task to receive messages from both
     // the broadcast stream and any direct sends (like Pong)
@@ -468,6 +477,7 @@ mod tests {
             workspace: None,
             session_manager: None,
             log_broadcaster: None,
+            log_level_handle: None,
             extension_manager: None,
             tool_registry: None,
             store: None,
@@ -476,6 +486,14 @@ mod tests {
             user_id: "test".to_string(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
+            llm_provider: None,
+            skill_registry: None,
+            skill_catalog: None,
+            chat_rate_limiter: crate::channels::web::server::RateLimiter::new(30, 60),
+            registry_entries: Vec::new(),
+            cost_guard: None,
+            startup_time: std::time::Instant::now(),
+            restart_requested: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }

@@ -15,6 +15,7 @@
 //! - `/compact` - Compact the context
 //! - `/new` - Start a new thread
 //! - `yes`/`no`/`always` - Respond to tool approval prompts
+//! - `Esc` - Interrupt current operation
 
 use std::borrow::Cow;
 use std::io::{self, Write};
@@ -28,13 +29,24 @@ use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
-use rustyline::{CompletionType, Editor, Helper};
+use rustyline::{
+    Cmd as ReadlineCmd, CompletionType, ConditionalEventHandler, Editor, Event, EventContext,
+    EventHandler, Helper, KeyCode, KeyEvent, Modifiers, RepeatCount,
+};
 use termimad::MadSkin;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::agent::truncate_for_preview;
+use crate::bootstrap::ironclaw_base_dir;
 use crate::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
 use crate::error::ChannelError;
+
+/// Max characters for tool result previews in the terminal.
+const CLI_TOOL_RESULT_MAX: usize = 200;
+
+/// Max characters for thinking/status messages in the terminal.
+const CLI_STATUS_MAX: usize = 200;
 
 /// Slash commands available in the REPL.
 const SLASH_COMMANDS: &[&str] = &[
@@ -114,6 +126,23 @@ impl Highlighter for ReplHelper {
 impl Validator for ReplHelper {}
 impl Helper for ReplHelper {}
 
+struct EscInterruptHandler {
+    triggered: Arc<AtomicBool>,
+}
+
+impl ConditionalEventHandler for EscInterruptHandler {
+    fn handle(
+        &self,
+        _evt: &Event,
+        _n: RepeatCount,
+        _positive: bool,
+        _ctx: &EventContext,
+    ) -> Option<ReadlineCmd> {
+        self.triggered.store(true, Ordering::Relaxed);
+        Some(ReadlineCmd::Interrupt)
+    }
+}
+
 /// Build a termimad skin with our color scheme.
 fn make_skin() -> MadSkin {
     let mut skin = MadSkin::default();
@@ -177,6 +206,8 @@ pub struct ReplChannel {
     debug_mode: Arc<AtomicBool>,
     /// Whether we're currently streaming (chunks have been printed without a trailing newline).
     is_streaming: Arc<AtomicBool>,
+    /// When true, the one-liner startup banner is suppressed (boot screen shown instead).
+    suppress_banner: Arc<AtomicBool>,
 }
 
 impl ReplChannel {
@@ -186,6 +217,7 @@ impl ReplChannel {
             single_message: None,
             debug_mode: Arc::new(AtomicBool::new(false)),
             is_streaming: Arc::new(AtomicBool::new(false)),
+            suppress_banner: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -195,7 +227,13 @@ impl ReplChannel {
             single_message: Some(message),
             debug_mode: Arc::new(AtomicBool::new(false)),
             is_streaming: Arc::new(AtomicBool::new(false)),
+            suppress_banner: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Suppress the one-liner startup banner (boot screen will be shown instead).
+    pub fn suppress_banner(&self) {
+        self.suppress_banner.store(true, Ordering::Relaxed);
     }
 
     fn is_debug(&self) -> bool {
@@ -231,6 +269,7 @@ fn print_help() {
     println!("  {c}/compact{r}           {d}compact context window{r}");
     println!("  {c}/new{r}               {d}new conversation thread{r}");
     println!("  {c}/interrupt{r}         {d}stop current operation{r}");
+    println!("  {c}esc{r}                {d}stop current operation{r}");
     println!();
     println!("  {h}Approval responses{r}");
     println!("  {c}yes{r} ({c}y{r})            {d}approve tool execution{r}");
@@ -241,10 +280,7 @@ fn print_help() {
 
 /// Get the history file path (~/.ironclaw/history).
 fn history_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".ironclaw")
-        .join("history")
+    ironclaw_base_dir().join("history")
 }
 
 #[async_trait]
@@ -257,11 +293,13 @@ impl Channel for ReplChannel {
         let (tx, rx) = mpsc::channel(32);
         let single_message = self.single_message.clone();
         let debug_mode = Arc::clone(&self.debug_mode);
+        let suppress_banner = Arc::clone(&self.suppress_banner);
+        let esc_interrupt_triggered_for_thread = Arc::new(AtomicBool::new(false));
 
         std::thread::spawn(move || {
             // Single message mode: send it and return
             if let Some(msg) = single_message {
-                let incoming = IncomingMessage::new("repl", "user", &msg);
+                let incoming = IncomingMessage::new("repl", "default", &msg);
                 let _ = tx.blocking_send(incoming);
                 return;
             }
@@ -284,6 +322,13 @@ impl Channel for ReplChannel {
 
             rl.set_helper(Some(ReplHelper));
 
+            rl.bind_sequence(
+                KeyEvent(KeyCode::Esc, Modifiers::NONE),
+                EventHandler::Conditional(Box::new(EscInterruptHandler {
+                    triggered: Arc::clone(&esc_interrupt_triggered_for_thread),
+                })),
+            );
+
             // Load history
             let hist_path = history_path();
             if let Some(parent) = hist_path.parent() {
@@ -291,8 +336,10 @@ impl Channel for ReplChannel {
             }
             let _ = rl.load_history(&hist_path);
 
-            println!("\x1b[1mIronClaw\x1b[0m  /help for commands, /quit to exit");
-            println!();
+            if !suppress_banner.load(Ordering::Relaxed) {
+                println!("\x1b[1mIronClaw\x1b[0m  /help for commands, /quit to exit");
+                println!();
+            }
 
             loop {
                 let prompt = if debug_mode.load(Ordering::Relaxed) {
@@ -311,7 +358,13 @@ impl Channel for ReplChannel {
                         // Handle local REPL commands (only commands that need
                         // immediate local handling stay here)
                         match line.to_lowercase().as_str() {
-                            "/quit" | "/exit" => break,
+                            "/quit" | "/exit" => {
+                                // Forward shutdown command so the agent loop exits even
+                                // when other channels (e.g. web gateway) are still active.
+                                let msg = IncomingMessage::new("repl", "default", "/quit");
+                                let _ = tx.blocking_send(msg);
+                                break;
+                            }
                             "/help" => {
                                 print_help();
                                 continue;
@@ -329,21 +382,28 @@ impl Channel for ReplChannel {
                             _ => {}
                         }
 
-                        let msg = IncomingMessage::new("repl", "user", line);
+                        let msg = IncomingMessage::new("repl", "default", line);
                         if tx.blocking_send(msg).is_err() {
                             break;
                         }
                     }
                     Err(ReadlineError::Interrupted) => {
-                        // Ctrl+C: send /interrupt
-                        let msg = IncomingMessage::new("repl", "user", "/interrupt");
-                        if tx.blocking_send(msg).is_err() {
+                        if esc_interrupt_triggered_for_thread.swap(false, Ordering::Relaxed) {
+                            // Esc: interrupt current operation and keep REPL open.
+                            let msg = IncomingMessage::new("repl", "default", "/interrupt");
+                            if tx.blocking_send(msg).is_err() {
+                                break;
+                            }
+                        } else {
+                            // Ctrl+C (VINTR): request graceful shutdown.
+                            let msg = IncomingMessage::new("repl", "default", "/quit");
+                            let _ = tx.blocking_send(msg);
                             break;
                         }
                     }
                     Err(ReadlineError::Eof) => {
                         // Ctrl+D: send /quit so the agent loop runs graceful shutdown
-                        let msg = IncomingMessage::new("repl", "user", "/quit");
+                        let msg = IncomingMessage::new("repl", "default", "/quit");
                         let _ = tx.blocking_send(msg);
                         break;
                     }
@@ -400,7 +460,8 @@ impl Channel for ReplChannel {
 
         match status {
             StatusUpdate::Thinking(msg) => {
-                eprintln!("  \x1b[90m\u{25CB} {msg}\x1b[0m");
+                let display = truncate_for_preview(&msg, CLI_STATUS_MAX);
+                eprintln!("  \x1b[90m\u{25CB} {display}\x1b[0m");
             }
             StatusUpdate::ToolStarted { name } => {
                 eprintln!("  \x1b[33m\u{25CB} {name}\x1b[0m");
@@ -413,7 +474,8 @@ impl Channel for ReplChannel {
                 }
             }
             StatusUpdate::ToolResult { name: _, preview } => {
-                eprintln!("    \x1b[90m{preview}\x1b[0m");
+                let display = truncate_for_preview(&preview, CLI_TOOL_RESULT_MAX);
+                eprintln!("    \x1b[90m{display}\x1b[0m");
             }
             StatusUpdate::StreamChunk(chunk) => {
                 // Print separator on the false-to-true transition
@@ -438,7 +500,8 @@ impl Channel for ReplChannel {
             }
             StatusUpdate::Status(msg) => {
                 if debug || msg.contains("approval") || msg.contains("Approval") {
-                    eprintln!("  \x1b[90m{msg}\x1b[0m");
+                    let display = truncate_for_preview(&msg, CLI_STATUS_MAX);
+                    eprintln!("  \x1b[90m{display}\x1b[0m");
                 }
             }
             StatusUpdate::ApprovalNeeded {

@@ -1,7 +1,9 @@
 //! Configuration management CLI commands.
 //!
 //! Commands for viewing and modifying settings.
-//! Settings are stored in PostgreSQL (env > DB > default).
+//! Settings are stored in the database (env > DB > default).
+
+use std::sync::Arc;
 
 use clap::Subcommand;
 
@@ -9,6 +11,17 @@ use crate::settings::Settings;
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum ConfigCommand {
+    /// Generate a default config.toml file
+    Init {
+        /// Output path (default: ~/.ironclaw/config.toml)
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+
+        /// Overwrite existing file
+        #[arg(long)]
+        force: bool,
+    },
+
     /// List all settings and their current values
     List {
         /// Show only settings matching this prefix (e.g., "agent", "heartbeat")
@@ -46,11 +59,9 @@ pub enum ConfigCommand {
 /// Connects to the database to read/write settings. Falls back to disk
 /// if the database is not available.
 pub async fn run_config_command(cmd: ConfigCommand) -> anyhow::Result<()> {
-    let _ = dotenvy::dotenv();
-
     // Try to connect to the DB for settings access
-    let store = match connect_store().await {
-        Ok(s) => Some(s),
+    let db: Option<Arc<dyn crate::db::Database>> = match connect_db().await {
+        Ok(d) => Some(d),
         Err(e) => {
             eprintln!(
                 "Warning: Could not connect to database ({}), using disk fallback",
@@ -60,39 +71,43 @@ pub async fn run_config_command(cmd: ConfigCommand) -> anyhow::Result<()> {
         }
     };
 
+    let db_ref = db.as_deref();
     match cmd {
-        ConfigCommand::List { filter } => list_settings(store.as_ref(), filter).await,
-        ConfigCommand::Get { path } => get_setting(store.as_ref(), &path).await,
-        ConfigCommand::Set { path, value } => set_setting(store.as_ref(), &path, &value).await,
-        ConfigCommand::Reset { path } => reset_setting(store.as_ref(), &path).await,
-        ConfigCommand::Path => show_path(store.is_some()),
+        ConfigCommand::Init { output, force } => init_toml(db_ref, output, force).await,
+        ConfigCommand::List { filter } => list_settings(db_ref, filter).await,
+        ConfigCommand::Get { path } => get_setting(db_ref, &path).await,
+        ConfigCommand::Set { path, value } => set_setting(db_ref, &path, &value).await,
+        ConfigCommand::Reset { path } => reset_setting(db_ref, &path).await,
+        ConfigCommand::Path => show_path(db_ref.is_some()),
     }
 }
 
-/// Bootstrap a DB connection for config commands.
-async fn connect_store() -> anyhow::Result<crate::history::Store> {
-    let config = crate::config::Config::from_env().map_err(|e| anyhow::anyhow!("{}", e))?;
-    let store = crate::history::Store::new(&config.database).await?;
-    store.run_migrations().await?;
-    Ok(store)
+/// Bootstrap a DB connection for config commands (backend-agnostic).
+async fn connect_db() -> anyhow::Result<Arc<dyn crate::db::Database>> {
+    let config = crate::config::Config::from_env()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    crate::db::connect_from_config(&config.database)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 const DEFAULT_USER_ID: &str = "default";
 
 /// Load settings: DB if available, else disk.
-async fn load_settings(store: Option<&crate::history::Store>) -> Settings {
+async fn load_settings(store: Option<&dyn crate::db::Database>) -> Settings {
     if let Some(store) = store {
         match store.get_all_settings(DEFAULT_USER_ID).await {
             Ok(map) if !map.is_empty() => return Settings::from_db_map(&map),
             _ => {}
         }
     }
-    Settings::load()
+    Settings::default()
 }
 
 /// List all settings.
 async fn list_settings(
-    store: Option<&crate::history::Store>,
+    store: Option<&dyn crate::db::Database>,
     filter: Option<String>,
 ) -> anyhow::Result<()> {
     let settings = load_settings(store).await;
@@ -105,10 +120,10 @@ async fn list_settings(
     println!();
 
     for (key, value) in all {
-        if let Some(ref f) = filter {
-            if !key.starts_with(f) {
-                continue;
-            }
+        if let Some(ref f) = filter
+            && !key.starts_with(f)
+        {
+            continue;
         }
 
         let display_value = if value.len() > 60 {
@@ -124,7 +139,7 @@ async fn list_settings(
 }
 
 /// Get a specific setting.
-async fn get_setting(store: Option<&crate::history::Store>, path: &str) -> anyhow::Result<()> {
+async fn get_setting(store: Option<&dyn crate::db::Database>, path: &str) -> anyhow::Result<()> {
     let settings = load_settings(store).await;
 
     match settings.get(path) {
@@ -140,7 +155,7 @@ async fn get_setting(store: Option<&crate::history::Store>, path: &str) -> anyho
 
 /// Set a setting value.
 async fn set_setting(
-    store: Option<&crate::history::Store>,
+    store: Option<&dyn crate::db::Database>,
     path: &str,
     value: &str,
 ) -> anyhow::Result<()> {
@@ -150,82 +165,94 @@ async fn set_setting(
         .set(path, value)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    // Save to DB if available, otherwise disk
-    if let Some(store) = store {
-        let json_value = match serde_json::from_str::<serde_json::Value>(value) {
-            Ok(v) => v,
-            Err(_) => serde_json::Value::String(value.to_string()),
-        };
-        store
-            .set_setting(DEFAULT_USER_ID, path, &json_value)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to save to database: {}", e))?;
-    } else {
-        settings.save()?;
-    }
+    let store = store.ok_or_else(|| {
+        anyhow::anyhow!("Database connection required to save settings. Check DATABASE_URL.")
+    })?;
+    let json_value = match serde_json::from_str::<serde_json::Value>(value) {
+        Ok(v) => v,
+        Err(_) => serde_json::Value::String(value.to_string()),
+    };
+    store
+        .set_setting(DEFAULT_USER_ID, path, &json_value)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to save to database: {}", e))?;
 
     println!("Set {} = {}", path, value);
     Ok(())
 }
 
 /// Reset a setting to default.
-async fn reset_setting(store: Option<&crate::history::Store>, path: &str) -> anyhow::Result<()> {
+async fn reset_setting(store: Option<&dyn crate::db::Database>, path: &str) -> anyhow::Result<()> {
     let default = Settings::default();
     let default_value = default
         .get(path)
         .ok_or_else(|| anyhow::anyhow!("Unknown setting: {}", path))?;
 
-    // Delete from DB (falling back to default) or reset on disk
-    if let Some(store) = store {
-        store
-            .delete_setting(DEFAULT_USER_ID, path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to delete setting from database: {}", e))?;
-    } else {
-        let mut settings = Settings::load();
-        settings.reset(path).map_err(|e| anyhow::anyhow!("{}", e))?;
-        settings.save()?;
-    }
+    let store = store.ok_or_else(|| {
+        anyhow::anyhow!("Database connection required to reset settings. Check DATABASE_URL.")
+    })?;
+    store
+        .delete_setting(DEFAULT_USER_ID, path)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to delete setting from database: {}", e))?;
 
     println!("Reset {} to default: {}", path, default_value);
+    Ok(())
+}
+
+/// Generate a default TOML config file.
+async fn init_toml(
+    store: Option<&dyn crate::db::Database>,
+    output: Option<std::path::PathBuf>,
+    force: bool,
+) -> anyhow::Result<()> {
+    let path = output.unwrap_or_else(Settings::default_toml_path);
+
+    if path.exists() && !force {
+        anyhow::bail!(
+            "Config file already exists: {}\nUse --force to overwrite.",
+            path.display()
+        );
+    }
+
+    // Start from current settings (DB or defaults) so the generated file
+    // reflects the user's existing configuration.
+    let settings = load_settings(store).await;
+
+    settings
+        .save_toml(&path)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    println!("Config file written to {}", path.display());
+    println!();
+    println!("Edit the file to customize settings.");
+    println!("Priority: env var > config.toml > database > defaults");
     Ok(())
 }
 
 /// Show the settings storage info.
 fn show_path(has_db: bool) -> anyhow::Result<()> {
     if has_db {
-        println!("Settings stored in: PostgreSQL (settings table)");
-        println!(
-            "Bootstrap config:   {}",
-            crate::bootstrap::BootstrapConfig::default_path().display()
-        );
+        println!("Settings stored in: database (settings table)");
     } else {
-        let path = Settings::default_path();
-        println!("Settings stored in: {} (disk fallback)", path.display());
-
-        if path.exists() {
-            let metadata = std::fs::metadata(&path)?;
-            println!("  Size: {} bytes", metadata.len());
-            if let Ok(modified) = metadata.modified() {
-                use std::time::SystemTime;
-                let duration = SystemTime::now()
-                    .duration_since(modified)
-                    .unwrap_or_default();
-                let secs = duration.as_secs();
-                if secs < 60 {
-                    println!("  Modified: {} seconds ago", secs);
-                } else if secs < 3600 {
-                    println!("  Modified: {} minutes ago", secs / 60);
-                } else if secs < 86400 {
-                    println!("  Modified: {} hours ago", secs / 3600);
-                } else {
-                    println!("  Modified: {} days ago", secs / 86400);
-                }
-            }
-        } else {
-            println!("  (does not exist, using defaults)");
-        }
+        println!("Settings stored in: PostgreSQL (not connected, using defaults)");
     }
+    println!(
+        "Env config:         {}",
+        crate::bootstrap::ironclaw_env_path().display()
+    );
+
+    let toml_path = Settings::default_toml_path();
+    let toml_status = if toml_path.exists() {
+        "found"
+    } else {
+        "not found (run `ironclaw config init` to create)"
+    };
+    println!(
+        "TOML config:        {} ({})",
+        toml_path.display(),
+        toml_status
+    );
 
     Ok(())
 }
@@ -256,5 +283,40 @@ mod tests {
         // Reset to default
         settings.reset("agent.name").unwrap();
         assert_eq!(settings.agent.name, "ironclaw");
+    }
+
+    #[tokio::test]
+    async fn init_toml_creates_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        init_toml(None, Some(path.clone()), false).await.unwrap();
+        assert!(path.exists());
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("[agent]"));
+    }
+
+    #[tokio::test]
+    async fn init_toml_refuses_overwrite_without_force() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "existing").unwrap();
+
+        let result = init_toml(None, Some(path.clone()), false).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn init_toml_force_overwrites() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "old content").unwrap();
+
+        init_toml(None, Some(path.clone()), true).await.unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("[agent]"));
     }
 }

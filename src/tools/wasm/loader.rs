@@ -39,10 +39,11 @@ use std::sync::Arc;
 
 use tokio::fs;
 
+use crate::secrets::SecretsStore;
 use crate::tools::registry::{ToolRegistry, WasmRegistrationError, WasmToolRegistration};
 use crate::tools::wasm::capabilities_schema::CapabilitiesFile;
 use crate::tools::wasm::{
-    Capabilities, WasmError, WasmStorageError, WasmToolRuntime, WasmToolStore,
+    Capabilities, OAuthRefreshConfig, WasmError, WasmStorageError, WasmToolRuntime, WasmToolStore,
 };
 
 /// Error during WASM tool loading.
@@ -77,12 +78,23 @@ pub enum WasmLoadError {
 pub struct WasmToolLoader {
     runtime: Arc<WasmToolRuntime>,
     registry: Arc<ToolRegistry>,
+    secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
 }
 
 impl WasmToolLoader {
     /// Create a new loader with the given runtime and registry.
     pub fn new(runtime: Arc<WasmToolRuntime>, registry: Arc<ToolRegistry>) -> Self {
-        Self { runtime, registry }
+        Self {
+            runtime,
+            registry,
+            secrets_store: None,
+        }
+    }
+
+    /// Set the secrets store for credential injection in WASM tools.
+    pub fn with_secrets_store(mut self, store: Arc<dyn SecretsStore + Send + Sync>) -> Self {
+        self.secrets_store = Some(store);
+        self
     }
 
     /// Load a single WASM tool from a file pair.
@@ -108,22 +120,24 @@ impl WasmToolLoader {
         }
         let wasm_bytes = fs::read(wasm_path).await?;
 
-        // Read capabilities (optional)
-        let capabilities = if let Some(cap_path) = capabilities_path {
+        // Read capabilities (optional) and extract OAuth refresh config
+        let (capabilities, oauth_refresh) = if let Some(cap_path) = capabilities_path {
             if cap_path.exists() {
                 let cap_bytes = fs::read(cap_path).await?;
                 let cap_file = CapabilitiesFile::from_bytes(&cap_bytes)
                     .map_err(|e| WasmLoadError::InvalidCapabilities(e.to_string()))?;
-                cap_file.to_capabilities()
+                let caps = cap_file.to_capabilities();
+                let oauth = resolve_oauth_refresh_config(&cap_file);
+                (caps, oauth)
             } else {
                 tracing::warn!(
                     path = %cap_path.display(),
                     "Capabilities file not found, using default (no permissions)"
                 );
-                Capabilities::default()
+                (Capabilities::default(), None)
             }
         } else {
-            Capabilities::default()
+            (Capabilities::default(), None)
         };
 
         // Register the tool
@@ -136,6 +150,8 @@ impl WasmToolLoader {
                 limits: None,
                 description: None,
                 schema: None,
+                secrets_store: self.secrets_store.clone(),
+                oauth_refresh,
             })
             .await?;
 
@@ -293,6 +309,50 @@ impl WasmToolLoader {
     }
 }
 
+/// Extract OAuth refresh configuration from a parsed capabilities file.
+///
+/// Returns `None` if there's no `auth.oauth` section or if the client_id
+/// can't be resolved from any source (inline, env var, or built-in defaults).
+///
+/// Fallback chain for client_id:
+///   `oauth.client_id` > env var (`oauth.client_id_env`) > `builtin_credentials()`
+fn resolve_oauth_refresh_config(cap_file: &CapabilitiesFile) -> Option<OAuthRefreshConfig> {
+    let auth = cap_file.auth.as_ref()?;
+    let oauth = auth.oauth.as_ref()?;
+
+    let builtin = crate::cli::oauth_defaults::builtin_credentials(&auth.secret_name);
+
+    let client_id = oauth
+        .client_id
+        .clone()
+        .or_else(|| {
+            oauth
+                .client_id_env
+                .as_ref()
+                .and_then(|env| std::env::var(env).ok())
+        })
+        .or_else(|| builtin.as_ref().map(|c| c.client_id.to_string()))?;
+
+    let client_secret = oauth
+        .client_secret
+        .clone()
+        .or_else(|| {
+            oauth
+                .client_secret_env
+                .as_ref()
+                .and_then(|env| std::env::var(env).ok())
+        })
+        .or_else(|| builtin.as_ref().map(|c| c.client_secret.to_string()));
+
+    Some(OAuthRefreshConfig {
+        token_url: oauth.token_url.clone(),
+        client_id,
+        client_secret,
+        secret_name: auth.secret_name.clone(),
+        provider: auth.provider.clone(),
+    })
+}
+
 /// Results from loading multiple tools.
 #[derive(Debug, Default)]
 pub struct LoadResults {
@@ -322,6 +382,31 @@ impl LoadResults {
 
 /// Compile-time project root, used to locate tools-src/ in dev builds.
 const CARGO_MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
+
+/// Resolve the WASM target directory for a given crate directory.
+///
+/// Checks (in order):
+/// 1. `CARGO_TARGET_DIR` env var (shared target dir)
+/// 2. `<crate_dir>/target/` (default per-crate layout)
+pub fn resolve_wasm_target_dir(crate_dir: &Path) -> PathBuf {
+    crate::registry::artifacts::resolve_target_dir(crate_dir)
+}
+
+/// Return the expected path to a compiled WASM artifact for a given crate.
+///
+/// Combines [`resolve_wasm_target_dir`] with the `wasm32-wasip2/release/` subdirectory
+/// and the binary name without extension (e.g. `slack_tool`).
+///
+/// `binary_name` should not include the `.wasm` extension; it is appended automatically.
+///
+/// This is a convenience function for callers that know the exact triple (wasip2)
+/// and binary name. For multi-triple search, use
+/// [`crate::registry::artifacts::find_wasm_artifact`] instead.
+pub fn wasm_artifact_path(crate_dir: &Path, binary_name: &str) -> PathBuf {
+    resolve_wasm_target_dir(crate_dir)
+        .join("wasm32-wasip2/release")
+        .join(format!("{}.wasm", binary_name))
+}
 
 /// Resolve the tools source directory.
 ///
@@ -366,9 +451,7 @@ pub async fn discover_dev_tools() -> Result<HashMap<String, DiscoveredTool>, std
         let crate_name = dir_name.replace('-', "_");
         let install_name = format!("{}-tool", dir_name);
 
-        let wasm_path = path
-            .join("target/wasm32-wasip2/release")
-            .join(format!("{}_tool.wasm", crate_name));
+        let wasm_path = wasm_artifact_path(&path, &format!("{}_tool", crate_name));
 
         if !wasm_path.exists() {
             continue;
@@ -617,5 +700,117 @@ mod tests {
                 discovered.wasm_path
             );
         }
+    }
+
+    #[test]
+    fn test_resolve_oauth_refresh_config_with_oauth() {
+        use crate::tools::wasm::capabilities_schema::{
+            AuthCapabilitySchema, CapabilitiesFile, OAuthConfigSchema,
+        };
+
+        let caps = CapabilitiesFile {
+            auth: Some(AuthCapabilitySchema {
+                secret_name: "google_oauth_token".to_string(),
+                provider: Some("google".to_string()),
+                oauth: Some(OAuthConfigSchema {
+                    authorization_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
+                    token_url: "https://oauth2.googleapis.com/token".to_string(),
+                    client_id: Some("test-client-id".to_string()),
+                    client_secret: Some("test-client-secret".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let config = super::resolve_oauth_refresh_config(&caps);
+        assert!(config.is_some());
+
+        let config = config.unwrap();
+        assert_eq!(config.token_url, "https://oauth2.googleapis.com/token");
+        assert_eq!(config.client_id, "test-client-id");
+        assert_eq!(config.client_secret, Some("test-client-secret".to_string()));
+        assert_eq!(config.secret_name, "google_oauth_token");
+        assert_eq!(config.provider, Some("google".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_oauth_refresh_config_no_auth() {
+        use crate::tools::wasm::capabilities_schema::CapabilitiesFile;
+
+        let caps = CapabilitiesFile::default();
+        let config = super::resolve_oauth_refresh_config(&caps);
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn test_resolve_oauth_refresh_config_no_oauth() {
+        use crate::tools::wasm::capabilities_schema::{AuthCapabilitySchema, CapabilitiesFile};
+
+        let caps = CapabilitiesFile {
+            auth: Some(AuthCapabilitySchema {
+                secret_name: "manual_token".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let config = super::resolve_oauth_refresh_config(&caps);
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn test_resolve_oauth_refresh_config_no_client_id() {
+        use crate::tools::wasm::capabilities_schema::{
+            AuthCapabilitySchema, CapabilitiesFile, OAuthConfigSchema,
+        };
+
+        // A non-Google provider with no client_id anywhere should return None
+        let caps = CapabilitiesFile {
+            auth: Some(AuthCapabilitySchema {
+                secret_name: "unknown_provider_token".to_string(),
+                oauth: Some(OAuthConfigSchema {
+                    authorization_url: "https://example.com/auth".to_string(),
+                    token_url: "https://example.com/token".to_string(),
+                    // No client_id, no client_id_env, no builtin
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let config = super::resolve_oauth_refresh_config(&caps);
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn test_resolve_oauth_refresh_config_builtin_google() {
+        use crate::tools::wasm::capabilities_schema::{
+            AuthCapabilitySchema, CapabilitiesFile, OAuthConfigSchema,
+        };
+
+        // google_oauth_token should fall back to built-in credentials
+        let caps = CapabilitiesFile {
+            auth: Some(AuthCapabilitySchema {
+                secret_name: "google_oauth_token".to_string(),
+                provider: Some("google".to_string()),
+                oauth: Some(OAuthConfigSchema {
+                    authorization_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
+                    token_url: "https://oauth2.googleapis.com/token".to_string(),
+                    // No inline client_id, should fall back to builtin
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let config = super::resolve_oauth_refresh_config(&caps);
+        assert!(config.is_some());
+        let config = config.unwrap();
+        assert!(!config.client_id.is_empty());
+        assert!(config.client_secret.is_some());
     }
 }

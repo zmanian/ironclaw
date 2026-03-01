@@ -1,35 +1,41 @@
 //! Built-in tools that come with the agent.
 
 mod echo;
-mod ecommerce;
 pub mod extension_tools;
 mod file;
 mod http;
 mod job;
 mod json;
-mod marketplace;
 mod memory;
-mod restaurant;
+mod message;
+pub mod path_utils;
 pub mod routine;
-mod shell;
-mod taskrabbit;
+pub(crate) mod shell;
+pub mod skill_tools;
 mod time;
+mod web_fetch;
 
 pub use echo::EchoTool;
-pub use ecommerce::EcommerceTool;
 pub use extension_tools::{
     ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,
 };
 pub use file::{ApplyPatchTool, ListDirTool, ReadFileTool, WriteFileTool};
 pub use http::HttpTool;
-pub use job::{CancelJobTool, CreateJobTool, JobStatusTool, ListJobsTool};
+pub use job::{
+    CancelJobTool, CreateJobTool, JobEventsTool, JobPromptTool, JobStatusTool, ListJobsTool,
+    PromptQueue, SchedulerSlot,
+};
 pub use json::JsonTool;
-pub use marketplace::MarketplaceTool;
 pub use memory::{MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool};
-pub use restaurant::RestaurantTool;
+pub use message::MessageTool;
 pub use routine::{
     RoutineCreateTool, RoutineDeleteTool, RoutineHistoryTool, RoutineListTool, RoutineUpdateTool,
 };
 pub use shell::ShellTool;
-pub use taskrabbit::TaskRabbitTool;
+pub use skill_tools::{SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool};
 pub use time::TimeTool;
+pub use web_fetch::WebFetchTool;
+
+mod html_converter;
+
+pub use html_converter::convert_html_to_markdown;

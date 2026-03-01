@@ -11,7 +11,10 @@ use async_trait::async_trait;
 use tokio::fs;
 
 use crate::context::JobContext;
-use crate::tools::tool::{Tool, ToolDomain, ToolError, ToolOutput};
+use crate::tools::builtin::path_utils::validate_path;
+use crate::tools::tool::{
+    ApprovalRequirement, Tool, ToolDomain, ToolError, ToolOutput, require_str,
+};
 use crate::workspace::paths as ws_paths;
 
 /// Well-known workspace filenames that must go through memory_write, not write_file.
@@ -36,7 +39,7 @@ fn is_workspace_path(path: &str) -> bool {
         .and_then(|f| f.to_str())
         .unwrap_or(path);
 
-    WORKSPACE_FILES.iter().any(|ws| *ws == filename)
+    WORKSPACE_FILES.contains(&filename)
         || path.starts_with("daily/")
         || path.starts_with("context/")
 }
@@ -49,79 +52,6 @@ const MAX_WRITE_SIZE: usize = 5 * 1024 * 1024;
 
 /// Maximum directory listing entries.
 const MAX_DIR_ENTRIES: usize = 500;
-
-/// Validate that a path is safe (no traversal attacks).
-fn validate_path(path_str: &str, base_dir: Option<&Path>) -> Result<PathBuf, ToolError> {
-    let path = PathBuf::from(path_str);
-
-    // Reject paths with suspicious components (validation only, no action needed)
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                // Allow .. but validate final path is within sandbox
-            }
-            std::path::Component::Normal(s) => {
-                let s = s.to_string_lossy();
-                if s.starts_with('.') && s != "." && s != ".." && !s.starts_with(".git") {
-                    // Hidden files are OK for .git, .gitignore, etc.
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Resolve to absolute path
-    let resolved = if path.is_absolute() {
-        path.canonicalize().unwrap_or_else(|_| path.clone())
-    } else if let Some(base) = base_dir {
-        base.join(&path)
-            .canonicalize()
-            .unwrap_or_else(|_| base.join(&path))
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(&path)
-    };
-
-    // If base_dir is set, ensure path is within it
-    if let Some(base) = base_dir {
-        // Canonicalize the base to handle symlinks (e.g., /var -> /private/var on macOS)
-        let base_canonical = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
-
-        // For files that don't exist yet, we need to check the parent directory
-        // and ensure the resolved path would be within the base
-        let check_path = if resolved.exists() {
-            resolved.canonicalize().unwrap_or_else(|_| resolved.clone())
-        } else {
-            // For non-existent files, canonicalize the parent and append the filename
-            if let Some(parent) = resolved.parent() {
-                if parent.exists() {
-                    let canonical_parent = parent
-                        .canonicalize()
-                        .unwrap_or_else(|_| parent.to_path_buf());
-                    if let Some(filename) = resolved.file_name() {
-                        canonical_parent.join(filename)
-                    } else {
-                        resolved.clone()
-                    }
-                } else {
-                    resolved.clone()
-                }
-            } else {
-                resolved.clone()
-            }
-        };
-
-        if !check_path.starts_with(&base_canonical) {
-            return Err(ToolError::NotAuthorized(format!(
-                "Path escapes sandbox: {}",
-                path_str
-            )));
-        }
-    }
-
-    Ok(resolved)
-}
 
 /// Read file contents tool.
 #[derive(Debug, Default)]
@@ -178,10 +108,7 @@ impl Tool for ReadFileTool {
         params: serde_json::Value,
         _ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
-        let path_str = params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("missing 'path' parameter".into()))?;
+        let path_str = require_str(&params, "path")?;
 
         let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let limit = params.get("limit").and_then(|v| v.as_u64());
@@ -243,8 +170,8 @@ impl Tool for ReadFileTool {
         true // File content could contain anything
     }
 
-    fn requires_approval(&self) -> bool {
-        true // Reading local files should require approval
+    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+        ApprovalRequirement::UnlessAutoApproved
     }
 
     fn domain(&self) -> ToolDomain {
@@ -303,10 +230,7 @@ impl Tool for WriteFileTool {
         params: serde_json::Value,
         _ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
-        let path_str = params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("missing 'path' parameter".into()))?;
+        let path_str = require_str(&params, "path")?;
 
         // Reject workspace paths: these live in the database, not on disk.
         if is_workspace_path(path_str) {
@@ -317,10 +241,7 @@ impl Tool for WriteFileTool {
             )));
         }
 
-        let content = params
-            .get("content")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("missing 'content' parameter".into()))?;
+        let content = require_str(&params, "content")?;
 
         let start = std::time::Instant::now();
 
@@ -356,8 +277,8 @@ impl Tool for WriteFileTool {
         Ok(ToolOutput::success(result, start.elapsed()))
     }
 
-    fn requires_approval(&self) -> bool {
-        true // File writes should require approval
+    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+        ApprovalRequirement::UnlessAutoApproved
     }
 
     fn requires_sanitization(&self) -> bool {
@@ -366,6 +287,10 @@ impl Tool for WriteFileTool {
 
     fn domain(&self) -> ToolDomain {
         ToolDomain::Container
+    }
+
+    fn rate_limit_config(&self) -> Option<crate::tools::tool::ToolRateLimitConfig> {
+        Some(crate::tools::tool::ToolRateLimitConfig::new(20, 200))
     }
 }
 
@@ -472,8 +397,8 @@ impl Tool for ListDirTool {
         false // Directory listings are safe
     }
 
-    fn requires_approval(&self) -> bool {
-        true // Directory listings can leak filesystem structure
+    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+        ApprovalRequirement::UnlessAutoApproved
     }
 
     fn domain(&self) -> ToolDomain {
@@ -625,20 +550,11 @@ impl Tool for ApplyPatchTool {
         params: serde_json::Value,
         _ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
-        let path_str = params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("missing 'path' parameter".into()))?;
+        let path_str = require_str(&params, "path")?;
 
-        let old_string = params
-            .get("old_string")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("missing 'old_string' parameter".into()))?;
+        let old_string = require_str(&params, "old_string")?;
 
-        let new_string = params
-            .get("new_string")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("missing 'new_string' parameter".into()))?;
+        let new_string = require_str(&params, "new_string")?;
 
         let replace_all = params
             .get("replace_all")
@@ -690,8 +606,8 @@ impl Tool for ApplyPatchTool {
         Ok(ToolOutput::success(result, start.elapsed()))
     }
 
-    fn requires_approval(&self) -> bool {
-        true // File edits should require approval
+    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+        ApprovalRequirement::UnlessAutoApproved
     }
 
     fn requires_sanitization(&self) -> bool {
@@ -701,11 +617,16 @@ impl Tool for ApplyPatchTool {
     fn domain(&self) -> ToolDomain {
         ToolDomain::Container
     }
+
+    fn rate_limit_config(&self) -> Option<crate::tools::tool::ToolRateLimitConfig> {
+        Some(crate::tools::tool::ToolRateLimitConfig::new(20, 200))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::builtin::path_utils::normalize_lexical;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -870,5 +791,82 @@ mod tests {
 
         let entries = result.result.get("entries").unwrap().as_array().unwrap();
         assert!(entries.len() >= 2);
+    }
+
+    #[test]
+    fn test_normalize_lexical() {
+        // Basic .. resolution
+        assert_eq!(
+            normalize_lexical(Path::new("/a/b/../c")),
+            PathBuf::from("/a/c")
+        );
+        // Multiple .. components
+        assert_eq!(
+            normalize_lexical(Path::new("/a/b/c/../../d")),
+            PathBuf::from("/a/d")
+        );
+        // . components stripped
+        assert_eq!(
+            normalize_lexical(Path::new("/a/./b/./c")),
+            PathBuf::from("/a/b/c")
+        );
+        // Cannot escape root
+        assert_eq!(
+            normalize_lexical(Path::new("/a/../../..")),
+            PathBuf::from("/")
+        );
+    }
+
+    #[test]
+    fn test_validate_path_rejects_traversal_nonexistent_parent() {
+        // The critical test: writing to ../../outside/newdir/file with base_dir
+        // set should be rejected even when the parent directory does not exist
+        // (i.e. canonicalize() cannot resolve it).
+        let dir = TempDir::new().unwrap();
+        let evil_path = format!(
+            "{}/../../outside/newdir/file.txt",
+            dir.path().to_str().unwrap()
+        );
+        let result = validate_path(&evil_path, Some(dir.path()));
+        assert!(
+            result.is_err(),
+            "Should reject traversal via non-existent parent, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_validate_path_rejects_relative_traversal() {
+        let dir = TempDir::new().unwrap();
+        let result = validate_path("../../etc/passwd", Some(dir.path()));
+        assert!(
+            result.is_err(),
+            "Should reject relative traversal, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_validate_path_allows_valid_nested_write() {
+        let dir = TempDir::new().unwrap();
+        let result = validate_path("subdir/newfile.txt", Some(dir.path()));
+        assert!(
+            result.is_ok(),
+            "Should allow nested writes within sandbox: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_validate_path_allows_dot_dot_within_sandbox() {
+        // a/b/../c resolves to a/c which is still inside the sandbox
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        let result = validate_path("a/b/../c.txt", Some(dir.path()));
+        assert!(
+            result.is_ok(),
+            "Should allow .. that stays within sandbox: {:?}",
+            result
+        );
     }
 }
