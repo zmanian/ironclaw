@@ -365,7 +365,7 @@ pub async fn start_server(
             header::HeaderName::from_static("content-security-policy"),
             header::HeaderValue::from_static(
                 "default-src 'self'; \
-                 script-src 'self' https://cdn.jsdelivr.net; \
+                 script-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; \
                  style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
                  font-src https://fonts.gstatic.com; \
                  connect-src 'self'; \
@@ -2894,12 +2894,14 @@ mod tests {
             "CSP must contain default-src"
         );
         assert!(
-            csp_str.contains("script-src 'self' https://cdn.jsdelivr.net"),
-            "CSP must allow cdn.jsdelivr.net scripts"
+            csp_str.contains(
+                "script-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com"
+            ),
+            "CSP must allow approved script CDNs used by the web UI"
         );
         assert!(
-            !csp_str.contains("cdnjs.cloudflare.com"),
-            "CSP must not allow cdnjs.cloudflare.com (not used in this codebase)"
+            csp_str.contains("cdnjs.cloudflare.com"),
+            "CSP must allow cdnjs.cloudflare.com for DOMPurify"
         );
         assert!(
             csp_str.contains("object-src 'none'"),
