@@ -46,7 +46,7 @@ struct NestingGuard<'a> {
 
 impl Drop for NestingGuard<'_> {
     fn drop(&mut self) {
-        *self.depth -= 1;
+        *self.depth = self.depth.saturating_sub(1);
     }
 }
 
@@ -751,10 +751,15 @@ impl Tool for WasmToolWrapper {
         // Resolve the tool executor: direct reference takes priority, then shared slot.
         let resolved_executor: Option<Arc<ToolExecutor>> =
             self.tool_executor.as_ref().cloned().or_else(|| {
-                self.tool_executor_slot
-                    .as_ref()
-                    .and_then(|slot| slot.read().ok())
-                    .and_then(|guard| guard.clone())
+                self.tool_executor_slot.as_ref().and_then(|slot| {
+                    match slot.read() {
+                        Ok(guard) => guard.clone(),
+                        Err(_) => {
+                            tracing::error!("tool_executor_slot RwLock is poisoned; PTC unavailable for this tool");
+                            None
+                        }
+                    }
+                })
             });
 
         // Build a tool resolver closure if we have a tool executor.
@@ -1221,7 +1226,7 @@ mod tests {
     use crate::tools::wasm::capabilities::Capabilities;
     use crate::tools::wasm::runtime::{WasmRuntimeConfig, WasmToolRuntime};
 
-    use super::WasmToolWrapper;
+    use super::{NestingGuard, WasmToolWrapper};
 
     #[test]
     fn test_wrapper_creation() {
@@ -1918,5 +1923,26 @@ mod tests {
             "Error should mention capability not granted, got: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn test_nesting_guard_drop_at_zero_does_not_panic() {
+        // NestingGuard::drop uses saturating_sub, so dropping with depth=0
+        // must not panic (underflow) and should leave depth at 0.
+        let mut depth: u32 = 0;
+        {
+            let _guard = NestingGuard { depth: &mut depth };
+            // guard drops here
+        }
+        assert_eq!(depth, 0);
+    }
+
+    #[test]
+    fn test_nesting_guard_decrements_depth() {
+        let mut depth: u32 = 3;
+        {
+            let _guard = NestingGuard { depth: &mut depth };
+        }
+        assert_eq!(depth, 2);
     }
 }

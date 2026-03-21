@@ -114,14 +114,21 @@ impl PtcScriptTool {
     }
 
     /// Truncate output to MAX_OUTPUT_SIZE with a truncation notice.
+    ///
+    /// Uses `is_char_boundary()` to find a safe cut point, avoiding panics
+    /// on multi-byte UTF-8 characters (emoji, CJK, accented characters).
     fn truncate_output(output: &str) -> String {
         if output.len() <= MAX_OUTPUT_SIZE {
             output.to_string()
         } else {
+            let mut truncate_at = MAX_OUTPUT_SIZE;
+            while !output.is_char_boundary(truncate_at) {
+                truncate_at -= 1;
+            }
             format!(
                 "{}\n\n[Output truncated at {} bytes]",
-                &output[..MAX_OUTPUT_SIZE],
-                MAX_OUTPUT_SIZE
+                &output[..truncate_at],
+                truncate_at
             )
         }
     }
@@ -332,6 +339,40 @@ mod tests {
         let long = "x".repeat(MAX_OUTPUT_SIZE + 100);
         let truncated = PtcScriptTool::truncate_output(&long);
         assert!(truncated.len() < long.len());
+        assert!(truncated.contains("[Output truncated"));
+    }
+
+    #[test]
+    fn test_truncate_output_multibyte_utf8() {
+        // U+1F600 (grinning face) is a 4-byte UTF-8 character.
+        // Build a string of emoji that exceeds MAX_OUTPUT_SIZE, ensuring the
+        // byte boundary falls mid-character to verify we don't panic.
+        let emoji = "\u{1F600}"; // 4 bytes
+        let count = MAX_OUTPUT_SIZE / emoji.len() + 10;
+        let long = emoji.repeat(count);
+        assert!(long.len() > MAX_OUTPUT_SIZE);
+
+        // This must not panic
+        let truncated = PtcScriptTool::truncate_output(&long);
+        assert!(truncated.contains("[Output truncated"));
+        // The truncated portion must be valid UTF-8 (it is, since it's a String)
+        // and must not exceed MAX_OUTPUT_SIZE in bytes (before the notice)
+        let content_end = truncated.find("\n\n[Output truncated").unwrap();
+        assert!(content_end <= MAX_OUTPUT_SIZE);
+        // Verify it ends on a character boundary (valid UTF-8 slice)
+        assert!(truncated[..content_end].is_char_boundary(content_end));
+    }
+
+    #[test]
+    fn test_truncate_output_two_byte_utf8() {
+        // U+00E9 (e-acute) is 2 bytes in UTF-8
+        let ch = "\u{00E9}";
+        let count = MAX_OUTPUT_SIZE / ch.len() + 10;
+        let long = ch.repeat(count);
+        assert!(long.len() > MAX_OUTPUT_SIZE);
+
+        // Must not panic
+        let truncated = PtcScriptTool::truncate_output(&long);
         assert!(truncated.contains("[Output truncated"));
     }
 
