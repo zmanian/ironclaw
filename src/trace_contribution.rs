@@ -4487,6 +4487,9 @@ fn safe_trace_remote_rejection_body(body: &str) -> String {
 fn trace_remote_request_failure_kind_for_reqwest_error(
     error: &reqwest::Error,
 ) -> TraceQueueTelemetryFailureKind {
+    if let Some(kind) = trace_queue_telemetry_failure_kind_for_error_source(error) {
+        return kind;
+    }
     let message = error_chain_message(error).to_ascii_lowercase();
     if error.is_timeout()
         || message.contains("timed out")
@@ -4511,6 +4514,47 @@ fn trace_remote_request_failure_kind_for_reqwest_error(
         TraceQueueTelemetryFailureKind::NetworkConnectionRefused
     } else {
         TraceQueueTelemetryFailureKind::Network
+    }
+}
+
+fn trace_queue_telemetry_failure_kind_for_error_source(
+    error: &(dyn Error + 'static),
+) -> Option<TraceQueueTelemetryFailureKind> {
+    let mut source = Some(error);
+    while let Some(cause) = source {
+        if let Some(reqwest_error) = cause.downcast_ref::<reqwest::Error>()
+            && reqwest_error.is_timeout()
+        {
+            return Some(TraceQueueTelemetryFailureKind::NetworkTimeout);
+        }
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>()
+            && let Some(kind) =
+                trace_queue_telemetry_failure_kind_for_io_error_kind(io_error.kind())
+        {
+            return Some(kind);
+        }
+        source = cause.source();
+    }
+    None
+}
+
+fn trace_queue_telemetry_failure_kind_for_io_error_kind(
+    kind: std::io::ErrorKind,
+) -> Option<TraceQueueTelemetryFailureKind> {
+    match kind {
+        std::io::ErrorKind::TimedOut => Some(TraceQueueTelemetryFailureKind::NetworkTimeout),
+        std::io::ErrorKind::ConnectionRefused => {
+            Some(TraceQueueTelemetryFailureKind::NetworkConnectionRefused)
+        }
+        std::io::ErrorKind::AddrNotAvailable
+        | std::io::ErrorKind::HostUnreachable
+        | std::io::ErrorKind::NetworkDown
+        | std::io::ErrorKind::NetworkUnreachable
+        | std::io::ErrorKind::NotConnected => Some(TraceQueueTelemetryFailureKind::NetworkOffline),
+        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset => {
+            Some(TraceQueueTelemetryFailureKind::Network)
+        }
+        _ => None,
     }
 }
 
@@ -6985,6 +7029,14 @@ fn trace_queue_telemetry_failure_kind(error: &anyhow::Error) -> TraceQueueTeleme
         if let Some(remote_failure) = cause.downcast_ref::<TraceRemoteRequestFailure>() {
             return remote_failure.kind;
         }
+        if let Some(llm_error) = cause.downcast_ref::<crate::llm::error::LlmError>()
+            && let Some(kind) = trace_queue_telemetry_failure_kind_for_llm_error(llm_error)
+        {
+            return kind;
+        }
+        if let Some(kind) = trace_queue_telemetry_failure_kind_for_error_source(cause) {
+            return kind;
+        }
         if let Some(reqwest_error) = cause.downcast_ref::<reqwest::Error>() {
             return trace_remote_request_failure_kind_for_reqwest_error(reqwest_error);
         }
@@ -7037,6 +7089,25 @@ fn trace_queue_telemetry_failure_kind(error: &anyhow::Error) -> TraceQueueTeleme
         TraceQueueTelemetryFailureKind::Queue
     } else {
         TraceQueueTelemetryFailureKind::Unknown
+    }
+}
+
+fn trace_queue_telemetry_failure_kind_for_llm_error(
+    error: &crate::llm::error::LlmError,
+) -> Option<TraceQueueTelemetryFailureKind> {
+    match error {
+        crate::llm::error::LlmError::AuthFailed { .. }
+        | crate::llm::error::LlmError::SessionExpired { .. }
+        | crate::llm::error::LlmError::SessionRenewalFailed { .. } => {
+            Some(TraceQueueTelemetryFailureKind::Credential)
+        }
+        crate::llm::error::LlmError::RateLimited { .. } => {
+            Some(TraceQueueTelemetryFailureKind::HttpRejection)
+        }
+        crate::llm::error::LlmError::RequestFailed { .. } => {
+            Some(TraceQueueTelemetryFailureKind::Network)
+        }
+        _ => None,
     }
 }
 
@@ -7626,6 +7697,26 @@ mod tests {
                 *current = self.fresh.clone();
             }
             Ok(current.clone())
+        }
+    }
+
+    struct FailingTestUploadCredentialProvider {
+        kind: std::io::ErrorKind,
+    }
+
+    #[async_trait]
+    impl TraceUploadCredentialProvider for FailingTestUploadCredentialProvider {
+        async fn bearer_token(
+            &self,
+            _policy: &StandingTraceContributionPolicy,
+            _context: &TraceUploadClaimContext,
+            _force_refresh: bool,
+        ) -> anyhow::Result<String> {
+            Err(std::io::Error::new(
+                self.kind,
+                "credential provider failed while using super-secret-token",
+            )
+            .into())
         }
     }
 
@@ -10233,6 +10324,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queue_flush_classifies_typed_submission_provider_connection_loss_before_text() {
+        let cases = [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+        ];
+
+        for io_kind in cases {
+            let scope = format!(
+                "trace-submission-provider-connection-loss-classification-test-{}",
+                Uuid::new_v4()
+            );
+            write_trace_policy_for_scope(
+                Some(&scope),
+                &StandingTraceContributionPolicy {
+                    enabled: true,
+                    ingestion_endpoint: Some("https://trace.example.com/v1/traces".to_string()),
+                    auto_submit_high_value_traces: true,
+                    min_submission_score: 0.0,
+                    ..Default::default()
+                },
+            )
+            .expect("policy writes");
+            let raw = RawTraceContribution::from_recorded_trace(
+                &sample_trace(),
+                RecordedTraceContributionOptions::default(),
+            );
+            let mut envelope = DeterministicTraceRedactor::default()
+                .redact_trace(raw)
+                .await
+                .expect("redaction should succeed");
+            apply_credit_estimate_to_envelope(&mut envelope);
+            queue_trace_envelope_for_scope(Some(&scope), &envelope)
+                .expect("queued envelope writes");
+
+            let report = flush_trace_contribution_queue_for_scope_with_credential_provider(
+                Some(&scope),
+                10,
+                &FailingTestUploadCredentialProvider { kind: io_kind },
+            )
+            .await
+            .expect("submission provider failure is held for retry");
+            assert_eq!(report.submitted, 0);
+            assert_eq!(report.held, 1);
+
+            let diagnostics = trace_queue_diagnostics_for_scope(Some(&scope)).expect("diagnostics");
+            let failure = diagnostics
+                .telemetry
+                .last_failure
+                .as_ref()
+                .expect("submission provider failure recorded");
+            assert_eq!(failure.kind, TraceQueueTelemetryFailureKind::Network);
+            assert!(failure.reason.contains("submission retry scheduled"));
+            assert!(failure.reason.contains("error_hash="));
+            assert!(!failure.reason.contains("super-secret-token"));
+
+            let _ = std::fs::remove_dir_all(trace_contribution_dir_for_scope(Some(&scope)));
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_flush_classifies_typed_status_sync_provider_io_errors_before_text() {
+        let cases = [
+            (
+                std::io::ErrorKind::TimedOut,
+                TraceQueueTelemetryFailureKind::NetworkTimeout,
+            ),
+            (
+                std::io::ErrorKind::NotConnected,
+                TraceQueueTelemetryFailureKind::NetworkOffline,
+            ),
+            (
+                std::io::ErrorKind::AddrNotAvailable,
+                TraceQueueTelemetryFailureKind::NetworkOffline,
+            ),
+            (
+                std::io::ErrorKind::NetworkDown,
+                TraceQueueTelemetryFailureKind::NetworkOffline,
+            ),
+            (
+                std::io::ErrorKind::NetworkUnreachable,
+                TraceQueueTelemetryFailureKind::NetworkOffline,
+            ),
+            (
+                std::io::ErrorKind::HostUnreachable,
+                TraceQueueTelemetryFailureKind::NetworkOffline,
+            ),
+            (
+                std::io::ErrorKind::ConnectionRefused,
+                TraceQueueTelemetryFailureKind::NetworkConnectionRefused,
+            ),
+        ];
+
+        for (io_kind, expected_kind) in cases {
+            let scope = format!(
+                "trace-status-sync-provider-io-classification-test-{}",
+                Uuid::new_v4()
+            );
+            write_trace_policy_for_scope(
+                Some(&scope),
+                &StandingTraceContributionPolicy {
+                    enabled: true,
+                    ingestion_endpoint: Some("http://127.0.0.1:9/v1/traces".to_string()),
+                    auto_submit_high_value_traces: true,
+                    min_submission_score: 0.0,
+                    ..Default::default()
+                },
+            )
+            .expect("policy writes");
+            write_local_trace_records_for_scope(
+                Some(&scope),
+                &[submitted_credit_record(1.0, None, None, Vec::new())],
+            )
+            .expect("local record writes");
+
+            flush_trace_contribution_queue_for_scope_with_credential_provider(
+                Some(&scope),
+                10,
+                &FailingTestUploadCredentialProvider { kind: io_kind },
+            )
+            .await
+            .expect("status sync provider failure is nonfatal during flush");
+            let diagnostics = trace_queue_diagnostics_for_scope(Some(&scope)).expect("diagnostics");
+            let failure = diagnostics
+                .telemetry
+                .last_failure
+                .as_ref()
+                .expect("status sync provider failure recorded");
+            assert_eq!(failure.kind, expected_kind);
+            assert!(failure.reason.contains("status sync failed"));
+            assert!(failure.reason.contains("error_hash="));
+            assert!(
+                !failure
+                    .reason
+                    .contains("credential provider failed while using super-secret-token")
+            );
+            assert!(!failure.reason.contains("super-secret-token"));
+
+            let _ = std::fs::remove_dir_all(trace_contribution_dir_for_scope(Some(&scope)));
+        }
+    }
+
+    #[tokio::test]
     async fn revoke_trace_submission_uses_refreshed_upload_claim() {
         let scope = format!("trace-revoke-refresh-test-{}", Uuid::new_v4());
         let submission_id = Uuid::new_v4();
@@ -11040,6 +11273,33 @@ mod tests {
             assert!(failure.reason.contains("error_hash="));
             assert!(!failure.reason.contains("private.example"));
             assert!(!failure.reason.contains("127.0.0.1"));
+        }
+    }
+
+    #[test]
+    fn queue_telemetry_classifies_typed_llm_auth_and_session_failures_without_raw_details() {
+        let now = Utc::now();
+        let cases = [
+            (
+                anyhow::Error::from(crate::llm::error::LlmError::AuthFailed {
+                    provider: "trace-secret-provider".to_string(),
+                }),
+                TraceQueueTelemetryFailureKind::Credential,
+            ),
+            (
+                anyhow::Error::from(crate::llm::error::LlmError::SessionExpired {
+                    provider: "trace-secret-provider".to_string(),
+                }),
+                TraceQueueTelemetryFailureKind::Credential,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            let failure =
+                trace_queue_telemetry_failure_with_label(&error, now, "provider boundary failed");
+            assert_eq!(failure.kind, expected);
+            assert!(failure.reason.contains("error_hash="));
+            assert!(!failure.reason.contains("trace-secret-provider"));
         }
     }
 

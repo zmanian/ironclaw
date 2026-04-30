@@ -6,28 +6,35 @@ This document tracks the migration path from the file-backed Trace Commons inges
 
 The MVP ingestion service still serves tenant-scoped JSON files under `TRACE_COMMONS_DATA_DIR` and derives lightweight records for review, analytics, credit, and replay export. That remains appropriate for local development and controlled pilots.
 
-This branch now contains the first production-storage bridge:
+TraceDAO server storage has moved out of Ironclaw. Ironclaw keeps the local
+trace contribution envelope/client surfaces; the hosted DB/object-store control
+plane now lives in the public `zmanian/tracedao-server` repository:
 
-- `migrations/V25__trace_corpus_storage.sql`, `migrations/V26__trace_object_ref_lifecycle.sql`, `migrations/V27__trace_corpus_rich_metadata.sql`, `migrations/V28__trace_vector_entries.sql`, `migrations/V29__trace_export_manifests.sql`, `migrations/V30__trace_export_manifest_items.sql`, `migrations/V32__trace_audit_hash_chain.sql`, `migrations/V33__trace_tenant_policies.sql`, `migrations/V37__trace_review_leases.sql`, `migrations/V38__trace_revocation_propagation_ledger.sql`, `migrations/V39__trace_export_jobs.sql`, `migrations/V40__trace_tenant_access_grants.sql`, and matching libSQL incremental migrations.
-- `src/trace_corpus_storage.rs` and `TraceCorpusStore` implementations for PostgreSQL and libSQL.
+- `migrations/V1__trace_commons_schema.sql` and
+  `migrations/libsql/V1__trace_commons_schema.sql`, consolidated as the server
+  landing schema for the full Trace Commons relational control plane.
+- `crates/tracedao-server/src/trace_corpus_storage.rs`,
+  `crates/tracedao-server/src/trace_artifact_store.rs`, and server-owned
+  PostgreSQL/libSQL backend implementations.
 - Optional ingest-service DB dual-write behind `TRACE_COMMONS_DB_DUAL_WRITE=true`.
 - Optional DB-backed tenant policy reads behind `TRACE_COMMONS_DB_TENANT_POLICY_READS=true`.
 - Tenant-policy export ABAC for replay, benchmark, and ranker exports using existing allowed consent scopes and allowed uses.
 - Optional fail-closed benchmark/ranker source object-ref validation behind `TRACE_COMMONS_DERIVED_EXPORT_REQUIRE_OBJECT_REFS=true`.
 - Admin-token tenant policy management through `/v1/admin/tenant-policy`, with hash-chained file audit events and safe DB audit metadata for policy version, allow-list counts, and the policy projection hash.
 - Admin-token config inspection through `/v1/admin/config-status`, returning only safe schema, DB cutover, object-primary, guardrail, max export item cap, submission quota, legal hold, and object-store-provider status fields with a read audit event.
+- Admin-token operational inspection through `/v1/admin/operational-summary` and `ironclaw traces operational-summary`, returning only safe tenant-scoped aggregate counts for submission status/risk, review SLA pressure, DB export manifests/jobs, retention jobs, vector coverage, and delayed credit totals with a read audit event.
 - Optional encrypted local artifact storage behind `TRACE_COMMONS_ARTIFACT_KEY_HEX`, with `TRACE_COMMONS_OBJECT_STORE=local_service` selecting the service-owned local encrypted backend used for production-shaped object refs.
 - Optional object-primary submit/review mode behind `TRACE_COMMONS_OBJECT_PRIMARY_SUBMIT_REVIEW=true`, which requires the DB/object-ref cutover guards and skips plaintext submitted/reviewed envelope body files while retaining compatibility metadata, derived records, and file audit rows. Object-primary envelope writes use unique encrypted artifact object ids per logical snapshot so review/process-evaluation writes do not overwrite ciphertext behind older submitted-envelope object refs.
 - Optional object-primary replay export mode behind `TRACE_COMMONS_OBJECT_PRIMARY_REPLAY_EXPORT=true`, which requires DB replay selection, required replay object refs, required DB mirror writes, and the service-local encrypted object store.
 - Optional object-primary benchmark/ranker export mode behind `TRACE_COMMONS_OBJECT_PRIMARY_DERIVED_EXPORTS=true`, which requires DB reviewer reads, required source object refs, export guardrails, required DB mirror writes, and the service-local encrypted object store before skipping plaintext benchmark artifact and ranker provenance files.
 - `TRACE_COMMONS_OBJECT_STORE=remote_service` now parses provider, bucket, KMS key, and service credential references and advertises a safe disabled remote object-store alias without accepting plaintext compatibility fallback. This is a fail-closed production configuration scaffold for the eventual service-owned remote object-store provider, not a remote object-store implementation yet.
 - Optional legal-hold retention policy IDs behind `TRACE_COMMONS_LEGAL_HOLD_RETENTION_POLICIES`, preventing maintenance from newly expiring or purging matching policy classes.
-- Optional DB-backed review leases behind `TRACE_COMMONS_DB_REVIEWER_READS=true`, scoped by tenant and reviewer/admin principal for concurrent privacy review coordination, with typed safe audit metadata for claim/release action and lease timing.
+- Optional DB-backed review leases behind `TRACE_COMMONS_DB_REVIEWER_READS=true`, scoped by tenant and reviewer/admin principal for concurrent privacy review coordination. The reviewer/admin `POST /v1/review/leases/claim-next` and `POST /v1/review/leases/claim-batch` routes plus `ironclaw traces review-lease-claim-next` and `ironclaw traces review-lease-claim-batch` helpers select only available quarantined traces in tenant scope using review escalation/SLA ordering before persisting lease state and typed safe claim audit rows.
 - Durable DB revocation-propagation item rows track tenant-scoped downstream invalidation or retry work for object refs, export manifests/items, vectors, derived artifacts, benchmark/ranker artifacts, credit settlement reversals, and physical delete receipts.
 - Replay dataset, benchmark conversion, and ranker export paths persist durable access-grant and export-job lifecycle rows; already-started jobs are terminalized as `failed` if DB metadata reads, source collection, source object-ref revalidation, source-read audit mirroring, or required object-ref body reads fail before export artifacts or manifests can be published.
 - Durable tenant access grant rows can store issuer-authorized principal, role, consent-scope, allowed-use, issuer/audience/subject, expiry, revocation, and safe metadata for hosted-agent multitenant permissioning. Admin routes and CLI helpers can create, list, and revoke the current tenant's grant rows while writing safe grant-update audit metadata. `TRACE_COMMONS_REQUIRE_TENANT_ACCESS_GRANTS=true` makes trace submission, contributor credit/status readback, reviewer/audit reads, review mutations, dataset/export paths, non-revocation worker mutations, maintenance, and admin ledger/observability reads fail closed unless the authenticated tenant/principal has an active exact-role grant. Signed EdDSA/Ed25519 claims must additionally match any configured grant issuer, audience, and JWT `sub` subject binding; static-token bridge grants keep exact-principal matching and ignore those signed-claim-only fields. Grant scope/use allow-lists are intersected with static or EdDSA claim allow-lists before the existing submission policy checks run; revocation/self-delete, revocation propagation, config-status, tenant-policy admin, and grant-management routes remain available for deprovisioning and recovery.
 - Optional fail-closed maintenance promotion gate behind `TRACE_COMMONS_REQUIRE_DB_RECONCILIATION_CLEAN=true`, which requires DB dual-write, rejects maintenance requests that omit `reconcile_db_mirror: true`, exposes compact `blocking_gaps`, and turns DB/file reconciliation gaps into `409 Conflict` maintenance failures.
-- Caller-level tests for tenant-scoped writes, DB-backed tenant policy enforcement, review/revocation state, delayed credit events, encrypted artifact receipts, and DB object-ref replay reads through the service-owned local object-store backend.
+- Caller-level tests for tenant-scoped writes, DB-backed tenant policy enforcement, review/revocation state, delayed credit events, encrypted artifact receipts, DB object-ref replay reads through the service-owned local object-store backend, fail-closed embedded-tenant validation for file-backed metadata, derived, ledger, audit, tombstone, replay manifest, export provenance, and benchmark artifact reads, service-local object-ref key-ref verification, encrypted benchmark artifact body verification, vector/benchmark/ranker payload deletion verification, privileged-action ABAC for review decisions, destructive purge, and tombstones, reasoned privileged revocation persistence across file/DB tombstones and audit rows, and the admin operational summary aggregate surface.
 
 Production still needs stronger guarantees before broad tenant rollout:
 
@@ -64,28 +71,37 @@ Do not put bearer tokens, raw local paths, raw sidecar spans, unredacted trace t
 
 ## Concrete DB Migration Slice
 
-This first production-storage slice has now been implemented as a dark-launch bridge. It creates the relational control plane only: envelope payloads belong in encrypted artifact storage, and vector payloads can stay in a vector store or backend-specific index. `src/bin/trace_commons_ingest.rs` can mirror metadata into the DB when `TRACE_COMMONS_DB_DUAL_WRITE=true`, including submission redaction counts, derived summary/tool/coverage metadata, vector-entry metadata, replay export manifest metadata, replay export source item rows, benchmark/ranker export provenance metadata, tombstones, and read/export/credit audit events. Vector indexing computes deterministic redacted-summary similarity for nearest-neighbor metadata, keeping exact canonical-summary hash matches as the strongest duplicate signal. When encrypted artifact storage is configured, vector indexing now also writes a redacted canonical-summary vector payload as a `worker_intermediate` object ref so a later embedding worker has an auditable, tenant-scoped payload handle without adding a DB column. Export audit rows now carry deterministic source-list hashes in `decision_inputs_hash` for replay datasets, benchmark conversion artifacts, and ranker training exports; file-backed audit rows also carry optional `previous_event_hash`/`event_hash` fields so pilot logs can be checked for simple append-order tampering while legacy rows remain readable, and DB audit rows mirror those chain fields when they are present on the file-backed event. Maintenance can return a verifier report with `verify_audit_chain: true`. Replay dataset exports also mirror durable tenant-scoped manifest rows with source ids, source-list hashes, per-source status/hash snapshots, and the active submitted-envelope object ref used at export time. Benchmark and ranker exports write file-backed provenance manifests by default and opportunistically mirror them into the same export manifest/item tables with source derived artifact refs plus active canonical-summary vector entry refs when vector metadata has already been indexed, while the replay manifest listing endpoint filters DB rows back to replay dataset manifests. Tenant policies now gate replay, benchmark, and ranker export requests and source selection using the same allowed-scope/allowed-use columns as ingest. `TRACE_COMMONS_DERIVED_EXPORT_REQUIRE_OBJECT_REFS=true` requires DB dual-write and makes benchmark/ranker exports fail closed before artifact, provenance, or utility-credit publication when any selected source lacks an active submitted-envelope object ref that can be tenant/hash verified. `TRACE_COMMONS_OBJECT_PRIMARY_SUBMIT_REVIEW=true` requires DB dual-write, required DB mirror writes, DB reviewer reads, reviewer object-ref reads, and the service-local encrypted object store, then writes submitted and reviewed envelope bodies only to the object store while leaving compatibility metadata/derived/audit files in place. `TRACE_COMMONS_OBJECT_PRIMARY_REPLAY_EXPORT=true` requires DB dual-write, required DB mirror writes, DB replay export reads, replay object-ref-required reads, and the service-local encrypted object store, then keeps replay export body reads on active DB object refs without file fallback. `TRACE_COMMONS_OBJECT_PRIMARY_DERIVED_EXPORTS=true` requires DB dual-write, required DB mirror writes, DB reviewer reads, required derived source object refs, export guardrails, and the service-local encrypted object store, then skips plaintext benchmark artifact/provenance and ranker provenance files; DB manifest/items remain the purpose-filter and lifecycle-invalidation index. The maintenance endpoint can expire past-due pilot records, mirror expiration status plus artifact invalidation into the DB, invalidate benchmark/ranker provenance manifests, backfill pilot file records into the DB, index accepted canonical summaries into deterministic vector metadata rows with `index_vectors: true`, and return a file-vs-DB reconciliation report with `reconcile_db_mirror: true`. Backfill isolates per-submission, credit-event, audit-event, and replay-manifest failures, returns `db_mirror_backfill_failed` plus bounded failure details, and keeps valid records moving while DB setup/listing failures still fail fast. Reconciliation now includes submission, derived, object-ref, vector, credit-ledger, audit-event, replay/export-manifest, export-item, revocation/tombstone counts, active derived/export rows that still point at invalid sources, reader-projection parity for contributor credit, reviewer metadata, analytics, audit, and replay/export manifest surfaces, plus compact `blocking_gaps`; `TRACE_COMMONS_REQUIRE_DB_RECONCILIATION_CLEAN=true` requires DB dual-write, rejects maintenance requests that omit `reconcile_db_mirror`, and turns those promotion-blocking gaps into `409 Conflict` maintenance failures after the normal maintenance audit event is appended. Reconciliation without a configured DB mirror returns `503 Service Unavailable`. File-backed APIs remain the default source of pilot responses. `TRACE_COMMONS_DB_CONTRIBUTOR_READS=true` can switch contributor credit, credit-event, and submission-status reads to the DB mirror after dual-write or backfill is in place. `TRACE_COMMONS_DB_REVIEWER_READS=true` can switch reviewer/admin metadata reads for analytics, trace listing, quarantine queue, active-learning queue, benchmark candidate conversion, and ranker exports to the DB mirror; review decisions also prefer active DB object refs for submitted-envelope body reads, mirror a content-read audit row, append a fresh reviewed-envelope object ref after approval or rejection, and can fail closed with `TRACE_COMMONS_DB_REVIEWER_REQUIRE_OBJECT_REFS=true` when no active object ref exists. `TRACE_COMMONS_DB_REPLAY_EXPORT_READS=true` can select replay export records from DB metadata and resolve submitted envelope bodies through active DB object refs for file or encrypted local artifact stores, with tenant/object-ref/hash verification and content-read audit mirroring that records `object_ref_id` for DB object-ref reads. Compatibility mode falls back to the file-backed envelope body if no active DB object ref exists; `TRACE_COMMONS_DB_REPLAY_EXPORT_REQUIRE_OBJECT_REFS=true` makes that surface fail closed. `TRACE_COMMONS_DB_AUDIT_READS=true` can serve reviewer audit reads from the DB mirror. `TRACE_COMMONS_REQUIRE_DB_MIRROR_WRITES=true` is the write-side production cutover switch: it requires DB dual-write and makes critical mirror misses on submissions, revocations, reviews, credit, exports/provenance, and audit/content-read rows fail closed.
+This first production-storage slice has now been implemented as a dark-launch bridge. It creates the relational control plane only: envelope payloads belong in encrypted artifact storage, and vector payloads can stay in a vector store or backend-specific index. The `tracedao-ingest` service in `zmanian/tracedao-server` can mirror metadata into the DB when `TRACE_COMMONS_DB_DUAL_WRITE=true`, including submission redaction counts, derived summary/tool/coverage metadata, vector-entry metadata, replay export manifest metadata, replay export source item rows, benchmark/ranker export provenance metadata, tombstones, and read/export/credit audit events. Vector indexing computes deterministic redacted-summary similarity for nearest-neighbor metadata, keeping exact canonical-summary hash matches as the strongest duplicate signal. When encrypted artifact storage is configured, vector indexing now also writes a redacted canonical-summary vector payload as a `worker_intermediate` object ref so a later embedding worker has an auditable, tenant-scoped payload handle without adding a DB column. Export audit rows now carry deterministic source-list hashes in `decision_inputs_hash` for replay datasets, benchmark conversion artifacts, and ranker training exports; file-backed audit rows also carry optional `previous_event_hash`/`event_hash` fields so pilot logs can be checked for simple append-order tampering while legacy rows remain readable, and DB audit rows mirror those chain fields when they are present on the file-backed event. Maintenance can return a verifier report with `verify_audit_chain: true`. Replay dataset exports also mirror durable tenant-scoped manifest rows with source ids, source-list hashes, per-source status/hash snapshots, and the active submitted-envelope object ref used at export time. Benchmark and ranker exports write file-backed provenance manifests by default and opportunistically mirror them into the same export manifest/item tables with source derived artifact refs plus active canonical-summary vector entry refs when vector metadata has already been indexed, while the replay manifest listing endpoint filters DB rows back to replay dataset manifests. Tenant policies now gate replay, benchmark, and ranker export requests and source selection using the same allowed-scope/allowed-use columns as ingest. `TRACE_COMMONS_DERIVED_EXPORT_REQUIRE_OBJECT_REFS=true` requires DB dual-write and makes benchmark/ranker exports fail closed before artifact, provenance, or utility-credit publication when any selected source lacks an active submitted-envelope object ref that can be tenant/hash verified. `TRACE_COMMONS_OBJECT_PRIMARY_SUBMIT_REVIEW=true` requires DB dual-write, required DB mirror writes, DB reviewer reads, reviewer object-ref reads, and the service-local encrypted object store, then writes submitted and reviewed envelope bodies only to the object store while leaving compatibility metadata/derived/audit files in place. `TRACE_COMMONS_OBJECT_PRIMARY_REPLAY_EXPORT=true` requires DB dual-write, required DB mirror writes, DB replay export reads, replay object-ref-required reads, and the service-local encrypted object store, then keeps replay export body reads on active DB object refs without file fallback. `TRACE_COMMONS_OBJECT_PRIMARY_DERIVED_EXPORTS=true` requires DB dual-write, required DB mirror writes, DB reviewer reads, required derived source object refs, export guardrails, and the service-local encrypted object store, then skips plaintext benchmark artifact/provenance and ranker provenance files; DB manifest/items remain the purpose-filter and lifecycle-invalidation index. The maintenance endpoint can expire past-due pilot records, mirror expiration status plus artifact invalidation into the DB, invalidate benchmark/ranker provenance manifests, backfill pilot file records into the DB, index accepted canonical summaries into deterministic vector metadata rows with `index_vectors: true`, and return a file-vs-DB reconciliation report with `reconcile_db_mirror: true`. Backfill isolates per-submission, credit-event, audit-event, and replay-manifest failures, returns `db_mirror_backfill_failed` plus bounded failure details, and keeps valid records moving while DB setup/listing failures still fail fast. Reconciliation now includes submission, derived, object-ref, vector, credit-ledger, audit-event, replay/export-manifest, export-item, revocation/tombstone counts, active derived/export rows that still point at invalid sources, reader-projection parity for contributor credit, reviewer metadata, analytics, audit, and replay/export manifest surfaces, plus compact `blocking_gaps`; `TRACE_COMMONS_REQUIRE_DB_RECONCILIATION_CLEAN=true` requires DB dual-write, rejects maintenance requests that omit `reconcile_db_mirror`, and turns those promotion-blocking gaps into `409 Conflict` maintenance failures after the normal maintenance audit event is appended. Reconciliation without a configured DB mirror returns `503 Service Unavailable`. File-backed APIs remain the default source of pilot responses. `TRACE_COMMONS_DB_CONTRIBUTOR_READS=true` can switch contributor credit, credit-event, and submission-status reads to the DB mirror after dual-write or backfill is in place. `TRACE_COMMONS_DB_REVIEWER_READS=true` can switch reviewer/admin metadata reads for analytics, trace listing, quarantine queue, active-learning queue, benchmark candidate conversion, and ranker exports to the DB mirror; review decisions also prefer active DB object refs for submitted-envelope body reads, mirror a content-read audit row, append a fresh reviewed-envelope object ref after approval or rejection, and can fail closed with `TRACE_COMMONS_DB_REVIEWER_REQUIRE_OBJECT_REFS=true` when no active object ref exists. `TRACE_COMMONS_DB_REPLAY_EXPORT_READS=true` can select replay export records from DB metadata and resolve submitted envelope bodies through active DB object refs for file or encrypted local artifact stores, with tenant/object-ref/hash verification and content-read audit mirroring that records `object_ref_id` for DB object-ref reads. Compatibility mode falls back to the file-backed envelope body if no active DB object ref exists; `TRACE_COMMONS_DB_REPLAY_EXPORT_REQUIRE_OBJECT_REFS=true` makes that surface fail closed. `TRACE_COMMONS_DB_AUDIT_READS=true` can serve reviewer audit reads from the DB mirror. `TRACE_COMMONS_REQUIRE_DB_MIRROR_WRITES=true` is the write-side production cutover switch: it requires DB dual-write and makes critical mirror misses on submissions, revocations, reviews, credit, exports/provenance, and audit/content-read rows fail closed.
 
 ### Safe Migration Naming
 
-Historical local state when this slice was created:
+Historical local state when this slice was first drafted:
 
 - Local PostgreSQL migrations in this worktree end at `migrations/V23__list_workspace_files_escape_like.sql`.
 - Local `src/db/libsql_migrations.rs` ends at incremental version `22`.
 - The local `origin/staging` ref already contains `migrations/V24__llm_calls_created_at_index.sql` and libSQL incremental version `24`.
 
-Completed guidance:
+Current guidance after the server split:
 
-- Before creating the migration, refresh refs with `git fetch origin` and re-check:
+- Ironclaw no longer lands Trace Commons relational migrations. Keep
+  `migrations/V25__wasm_fuel_limit_bump.sql` as the next Ironclaw migration and
+  do not add TraceDAO server tables to Ironclaw's refinery/libSQL migration
+  streams.
+- The TraceDAO server repo owns the storage landing schema as
+  `migrations/V1__trace_commons_schema.sql` plus the matching libSQL schema
+  file. Re-check the server repo's migration stream before adding future server
+  storage migrations.
+- Before creating any future Ironclaw migration, refresh refs with
+  `git fetch origin` and re-check:
   - `git ls-tree --name-only origin/staging:migrations`
   - `git ls-tree --name-only origin/main:migrations`
   - `git show origin/staging:src/db/libsql_migrations.rs | rg '"[a-z_]+",|\\([[:space:]]*[0-9]+,'`
   - `git show origin/main:src/db/libsql_migrations.rs | rg '"[a-z_]+",|\\([[:space:]]*[0-9]+,'`
-- Staging/main were highest at `V24`, so the PostgreSQL migration is `migrations/V25__trace_corpus_storage.sql`.
-- The libSQL migration is incremental version `25` named `"trace_corpus_storage"`. The libSQL number does not always match PostgreSQL historically, but both staging and this batch are now highest at `25`.
-- Do not add `IF NOT EXISTS` to PostgreSQL migration DDL unless the repo's refinery policy changes. PostgreSQL migrations should be one-shot and checksum-stable.
-- For libSQL, use `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS`, and add only idempotent DDL to `INCREMENTAL_MIGRATIONS`.
-- After adding a real PostgreSQL migration, update `migrations/checksums.lock` using the repo's migration checksum workflow.
+- Do not add `IF NOT EXISTS` to Ironclaw PostgreSQL migration DDL unless the
+  repo's refinery policy changes. PostgreSQL migrations should be one-shot and
+  checksum-stable.
+- After adding a real Ironclaw PostgreSQL migration, update
+  `migrations/checksums.lock` using the repo's migration checksum workflow.
 
 ### PostgreSQL DDL Sketch
 
@@ -411,16 +427,18 @@ CREATE TABLE trace_retention_job_items (
 CREATE INDEX idx_trace_retention_job_items_submission ON trace_retention_job_items(tenant_id, submission_id, created_at DESC);
 ```
 
-V31 adds the first PostgreSQL RLS policy layer for the tenant-scoped Trace Commons metadata tables:
+The server-owned `V1__trace_commons_schema.sql` migration in
+`zmanian/tracedao-server` includes the first PostgreSQL RLS policy layer for
+the tenant-scoped Trace Commons metadata tables:
 
 ```sql
 ALTER TABLE trace_submissions ENABLE ROW LEVEL SECURITY;
 CREATE POLICY trace_submissions_tenant_isolation ON trace_submissions
-    USING (tenant_id = current_setting('ironclaw.trace_tenant_id', true))
-    WITH CHECK (tenant_id = current_setting('ironclaw.trace_tenant_id', true));
+    USING (tenant_id = current_setting('tracedao.trace_tenant_id', true))
+    WITH CHECK (tenant_id = current_setting('tracedao.trace_tenant_id', true));
 ```
 
-The migration intentionally does not use `FORCE ROW LEVEL SECURITY`, so table owners still bypass policies for safe migrations, backfills, and repairs while the runtime moves to transaction-local tenant context. Before production cutover, every PG-backed Trace Commons store path should set `SELECT set_config('ironclaw.trace_tenant_id', $1, true)` inside the operation transaction, and worker roles should get explicit policy variants, not blanket bypass.
+The migration intentionally does not use `FORCE ROW LEVEL SECURITY`, so table owners still bypass policies for safe migrations, backfills, and repairs while the runtime moves to transaction-local tenant context. Before production cutover, every PG-backed Trace Commons store path should set `SELECT set_config('tracedao.trace_tenant_id', $1, true)` inside the operation transaction, and worker roles should get explicit policy variants, not blanket bypass.
 
 ### libSQL DDL Sketch
 
@@ -749,7 +767,16 @@ CREATE INDEX IF NOT EXISTS idx_trace_retention_job_items_submission ON trace_ret
 
 ### Rust Store Contract Shape
 
-The initial Rust contract now lives in `src/trace_corpus_storage.rs`. `TraceCorpusStore` is part of the shared `Database` trait because both PostgreSQL and libSQL implementations exist in this branch. `src/bin/trace_commons_ingest.rs` still serves file-backed responses, but it can mirror submit/review/credit/revoke mutations into the configured DB for dark-launch verification and uses DB-backed reviewer reads for durable review leases.
+The Rust storage contract now lives in
+`zmanian/tracedao-server:crates/tracedao-server/src/trace_corpus_storage.rs`.
+It is no longer part of Ironclaw's shared `Database` trait. The
+`tracedao-ingest` service still serves file-backed responses by default, but it
+can mirror submit/review/credit/revoke mutations into its configured DB for
+dark-launch verification, including reasoned privileged revocation tombstones
+and revoke audit rows, and uses DB-backed reviewer reads for durable review
+leases. Claim-next and claim-batch stay reviewer queue ergonomics slices: they
+do not broaden review decision authority, and they only claim available
+quarantined tenant rows before lease/audit persistence.
 
 The first implementation-facing shape should stay close to:
 
@@ -1025,8 +1052,7 @@ Do not mutate historical ledger rows. Materialized credit totals can be cached s
 
 Every export item needs an audit event or an audit batch event with a cryptographic item list hash. The pilot replay, benchmark, and ranker export paths already write a deterministic source-list hash into both the exported artifact/manifest and the mirrored audit `decision_inputs_hash`; benchmark and ranker exports also persist file-backed provenance manifests, and replay dataset exports promote that hash plus item-level source snapshots into durable DB manifests.
 
-Pilot `V29` implements the compact `trace_export_manifests` control row for replay dataset exports in both PostgreSQL and libSQL. It stores tenant id, export manifest id, artifact kind, purpose, audit event id, source submission ids, source-list hash, item count, generation time, and invalidation/deletion timestamps. Pilot `V30` adds `trace_export_manifest_items` rows for each replay export source, including source object ref ids, source status/hash snapshots, and per-item revocation, expiration, or purge invalidation. Pilot `V36` adds `trace_retention_jobs` and `trace_retention_job_items` rows so maintenance/retention runs have a tenant-scoped durable ledger of run parameters, aggregate action counts, and per-submission expire/purge/revoke lifecycle counts. Pilot `V37` adds durable review lease fields to `trace_submissions` for reviewer/admin claim/release coordination.
-Pilot `V39` adds durable Trace Commons export access grants and export job rows. The grant row records the short-lived authorization slice issued to a caller, including principal, dataset kind, purpose, cap, expiry, status, and safe metadata. The job row records the tenant-scoped export work slice that consumes that grant, including lifecycle timestamps, optional result manifest id, item count, last error, and metadata. Replay, benchmark conversion, ranker-candidate, and ranker-pair export call sites now mirror one-shot grants and running/complete job state into these tables, with required DB mirror mode failing closed if the durable job row cannot be started or completed.
+The consolidated Trace Commons migration implements the compact `trace_export_manifests` control row for replay dataset exports in both PostgreSQL and libSQL. It stores tenant id, export manifest id, artifact kind, purpose, audit event id, source submission ids, source-list hash, item count, generation time, and invalidation/deletion timestamps. It also includes `trace_export_manifest_items` rows for each replay export source, durable `trace_retention_jobs` and `trace_retention_job_items` rows, durable review lease fields on `trace_submissions`, revocation-propagation rows, tenant-access grants, and export access grant/job rows. Replay, benchmark conversion, ranker-candidate, and ranker-pair export call sites now mirror one-shot grants and running/complete job state into these tables, with required DB mirror mode failing closed if the durable job row cannot be started or completed.
 
 ### Benchmark Artifacts
 
@@ -1193,22 +1219,83 @@ Each migration batch should verify:
 - Vector entries do not exist for revoked, rejected, quarantined, expired, or out-of-scope submissions.
 - Audit import events cover every migrated submission and object ref.
 
+## Operator Promotion Runbook Draft
+
+This is a finish-line checklist for canary tenants. It documents the current branch shape; it does not mean Trace Commons is broadly production-ready.
+
+Common preflight:
+
+- Start with `GET /v1/admin/config-status` and confirm DB dual-write, required DB mirror writes, object-store mode, tenant rollout gates, RLS readiness, and issuer/keyset health without relying on raw tenant ids, key ids, PEMs, hosts, or credentials in logs. Then read `GET /v1/admin/operational-summary` or run `ironclaw traces operational-summary` for safe aggregate submission, review SLA, export, retention, vector, and delayed-credit rollout signals.
+- Require active tenant access grants for the exact tenant/principal/role combinations being tested. With `TRACE_COMMONS_REQUIRE_TENANT_ACCESS_GRANTS=true`, submission, contributor status, reviewer/audit reads, review mutations, dataset/export paths, non-revocation worker mutations, maintenance, and admin ledger/observability reads fail closed without matching grants.
+- Run `POST /v1/admin/maintenance` with `dry_run: true`, `reconcile_db_mirror: true`, and `verify_audit_chain: true`. If `TRACE_COMMONS_REQUIRE_DB_RECONCILIATION_CLEAN=true` is enabled, requests that omit `reconcile_db_mirror` are expected to fail closed.
+- Treat any `blocking_gaps`, object-ref readability/hash failures, key-ref mismatches, projection drift, audit-chain mismatches, RLS readiness failures, signed-claim failures, or unexpected worker skips as promotion blockers.
+
+Per-tenant rollout:
+
+- Promote one tenant and one surface family at a time. Prefer the tenant allowlist flags for DB contributor, reviewer, replay export, audit, tenant-policy, object-ref-required, and object-primary gates before enabling global flags.
+- Read cutover order should be DB reader flags first, then object-ref-required modes, then object-primary submit/review, replay export, and derived export modes. Keep file-backed reads available for the rollback window.
+- Each promoted tenant needs a smoke pass for submit/status, contributor credit/events, reviewer queue/list/review mutation with required reasons, replay export selection, audit reads, tenant access grant enforcement, and one negative cross-tenant same-id read.
+- Keep a fallback tenant on file-backed behavior during the canary so operator smoke checks prove rollout gates are actually scoped.
+
+Rollback:
+
+- Roll back with flags and allowlists first: disable the tenant's DB read, object-ref-required, object-primary, vector, export, or retention-delete gates and leave DB/object dual-write evidence intact.
+- Do not delete DB rows, audit events, revocation tombstones, retention job/items, export manifests, or physical-delete receipts as part of rollback. They are evidence and replay inputs.
+- If object-primary reads fail, pause the affected surface, inspect object-ref readability/hash/key-ref diagnostics, and fall back to file-backed reads where compatibility still exists.
+- If retention deletion misfires, stop retention/revocation workers, preserve tombstones/audit rows, and restore from object versioning where available rather than rewriting history.
+
+Key rotation:
+
+- Rotate upload-claim issuer keys through managed EdDSA/Ed25519 keysets with `kid` selection. Publish the new key, wait for guarded refresh to report healthy safe counts, then begin issuing claims with the new `kid`.
+- Keep the previous key active through the maximum accepted claim lifetime plus the issuer-keyset refresh and max-stale window. Remove it only after old-`kid` claims have aged out.
+- Production-gated paths should use managed EdDSA/Ed25519 claims. Static tokens and HS256 claims remain bridge credentials and should not be part of the production rotation drill.
+- A missing, inactive, unmanaged, or stale `kid` should fail closed; use that as a smoke check before broadening a rotation.
+
+Object-store migration:
+
+- The implemented service-owned object backend is `TRACE_COMMONS_OBJECT_STORE=local_service`. It is suitable for object-primary canaries and verifies tenant storage refs, encryption key refs, decryptability, and object hashes.
+- `TRACE_COMMONS_OBJECT_STORE=remote_service` currently parses provider, bucket, KMS key, and credential refs but deliberately fails closed behind the disabled `trace_commons_service_owned_remote_disabled` provider. It is a configuration scaffold, not a remote object-store implementation.
+- Do not promote remote object storage until a real provider, migration manifest, object versioning/restore story, payload delete receipts, and rollback drill exist. Existing migration tooling is still a local-service bridge, and `remote_service` payload deletes are unsupported future work.
+- For local object-primary canaries, smoke submit/review envelope reads, replay export body reads, benchmark/ranker source object-ref validation, and revocation/retention object deletion for submitted/review, vector, benchmark, and ranker payload refs against exact tenant/object/hash/key-ref matches.
+
+Retention purge dry runs:
+
+- Run retention as dry-run first through `/v1/admin/maintenance` or `/v1/workers/retention-maintenance`, with an explicit purpose, legal-hold policies configured, and DB reconciliation/audit-chain verification enabled from the admin route when promotion evidence is needed.
+- Inspect retention job and item rows through `/v1/admin/retention/jobs` and `/v1/admin/retention/jobs/{retention_job_id}/items` before destructive purge. Dry runs should not mark records purged or delete object files.
+- Destructive purge should remain tenant-scoped, resumable, and reversible where object versioning exists. It should not start while reconciliation or audit-chain checks are red.
+
+Audit-chain verification:
+
+- Use maintenance `verify_audit_chain: true` for the tenant before enabling DB audit reads or publishing derived/export artifacts from that tenant.
+- Require append-order verification for hash-chained file-backed audit rows and DB mirror hash fields where present. Projection drift or stale predecessor rejection is a blocker, not a warning.
+- Export smoke checks should verify source-list hashes and that revoked, expired, quarantined, rejected, or out-of-scope sources cannot enter new manifests.
+
+Promotion-gate smoke checks:
+
+- DB reconciliation: `blocking_gaps` is empty, including current retention job/item gaps, credit-ledger gaps, audit-event gaps, reader-projection parity gaps, and object-ref readability/hash/key-ref gaps.
+- Tenant access: active grants allow intended operations and revoked/expired/wrong-role grants fail closed without blocking revocation/self-delete, revocation propagation, config-status, tenant-policy admin, or grant-management recovery paths.
+- Revocation propagation: a canary source produces tombstone-first invalidation, exact delayed-credit settlement reversal with deterministic negative ledger rows, vector/export invalidation, and service-local submitted/review/vector/benchmark/ranker object deletion only for exact hash-verified targets.
+- Object-primary: local-service reads and deletes verify tenant key refs and hashes; unsupported `remote_service` payload deletes and unsupported artifact kinds remain skipped or future work rather than silently succeeding.
+- Retention: dry-run counts match the intended tenant slice, legal holds are honored, and destructive purge is not enabled until the dry-run, reconciliation, audit-chain, and rollback evidence has been reviewed.
+
 ## Migration and Test Checklist
 
-Implementation checklist for the first real storage migration:
+Implementation checklist for the server-owned storage migration:
 
-- Refresh `origin/staging` and `origin/main`; choose the next migration number after the highest migration present on either branch. Completed for `V25`.
-- Add `migrations/VN__trace_corpus_storage.sql` with the PostgreSQL DDL, and update `migrations/checksums.lock` through the repo migration checksum workflow. Completed for `V25`, with vector-entry metadata added in `V28`, compact export manifest metadata added in `V29`, export manifest item rows added in `V30`, and export grant/job persistence added in `V39`.
-- Add a same-version `"trace_corpus_storage"` entry to `INCREMENTAL_MIGRATIONS` in `src/db/libsql_migrations.rs`. Completed for version `25`, with `trace_vector_entries` added in version `28`, `trace_export_manifests` added in version `29`, `trace_export_manifest_items` added in version `30`, and `trace_export_jobs` added in libSQL incremental version `38`.
-- If the libSQL base `SCHEMA` is updated for fresh installs, keep the incremental migration idempotent and make sure fresh and upgraded databases converge to the same schema.
-- Add `TraceCorpusStore` to the `Database` trait only after both `PgBackend` and `LibSqlBackend` implementations exist. Completed.
+- Keep Ironclaw free of TraceDAO server DB/object-store migrations and storage
+  backend modules. Completed by pruning the TraceCorpusStore bridge from
+  Ironclaw.
+- Add the PostgreSQL and libSQL Trace Commons landing schema in
+  `zmanian/tracedao-server`. Completed as server repo `V1` schema files.
+- Keep `TraceCorpusStore` inside the server crate's DB facade rather than
+  Ironclaw's shared `Database` trait. Completed.
 - Keep DB writes behind a dark-launch or dual-write flag until parity checks pass. Completed with `TRACE_COMMONS_DB_DUAL_WRITE=true`.
 - After parity checks pass, promote critical writes with `TRACE_COMMONS_REQUIRE_DB_MIRROR_WRITES=true` so DB mirror failures fail closed instead of creating file-only accepted submissions, credit events, export provenance, or audit/content-read rows.
 - Keep DB reads behind surface-specific rollout flags until parity checks pass. Contributor credit/status reads are gated by `TRACE_COMMONS_DB_CONTRIBUTOR_READS=true`, reviewer metadata reads by `TRACE_COMMONS_DB_REVIEWER_READS=true`, replay export selection by `TRACE_COMMONS_DB_REPLAY_EXPORT_READS=true`, and audit event reads by `TRACE_COMMONS_DB_AUDIT_READS=true`.
 - Keep object payloads in encrypted artifact/object storage; write only object refs and hashes into DB. Completed for the local encrypted artifact sidecar, DB object-ref-backed replay envelope reads, schema-versioned benchmark conversion artifacts with audited registry/evaluation lifecycle updates, source object-ref gating for benchmark/ranker derived exports, object-primary submit/review envelope body storage, and object-primary replay export body reads; remote service-owned object storage and broader object-primary read surfaces remain future work.
-- Propagate revocation and retention expiration to DB metadata before DB-first reads. Completed for submission status, tombstones, object-ref invalidation, derived-record invalidation, vector-entry invalidation, replay export manifest/item invalidation, file-backed benchmark/ranker provenance invalidation, contributor credit/status reads, reviewer metadata reads, maintenance repair of already file-marked revoked submissions, retention-expired submission/object/derived/export invalidation, audit events for invalidation counts, and durable retention job/item ledger rows for maintenance runs.
+- Propagate revocation and retention expiration to DB metadata before DB-first reads. Completed for submission status, tombstones, reasoned privileged revocation audit rows, object-ref invalidation, derived-record invalidation, vector-entry invalidation, replay export manifest/item invalidation, file-backed benchmark/ranker provenance invalidation, exact delayed-credit settlement reversal, contributor credit/status reads, reviewer metadata reads, maintenance repair of already file-marked revoked submissions, retention-expired submission/object/derived/export invalidation, audit events for invalidation counts, and durable retention job/item ledger rows for maintenance runs.
 - Add a backfill tool that reads the file-backed tenant directories, validates envelopes, recomputes redaction and summary hashes, writes metadata, and emits audit import events. Initial maintenance-triggered DB mirror backfill exists for already-derived file-backed submissions and now isolates per-item failures with bounded reporting; full recompute/import manifests remain future work.
-- Add a reconciliation command that compares file-backed responses with DB-backed metadata for status, review queues, credit, analytics, replay export, object refs, and tombstones. Maintenance reconciliation now covers metadata counts, invalid-source derived/export diagnostics, reader-projection parity for contributor, reviewer metadata, analytics, audit, and replay/export manifest surfaces, and compact `blocking_gaps`; `TRACE_COMMONS_REQUIRE_DB_RECONCILIATION_CLEAN=true` can require reconciliation and make remaining gaps fail closed during production promotion. Remaining work is PostgreSQL breadth, remote object storage, and broader object-primary reads.
+- Add a reconciliation command that compares file-backed responses with DB-backed metadata for status, review queues, credit, analytics, replay export, object refs, and tombstones. Maintenance reconciliation now covers metadata counts, invalid-source derived/export diagnostics, active object-ref readability/hash/key-ref mismatch diagnostics, reader-projection parity for contributor, reviewer metadata, analytics, audit, and replay/export manifest surfaces, and compact `blocking_gaps`; `TRACE_COMMONS_REQUIRE_DB_RECONCILIATION_CLEAN=true` can require reconciliation and make remaining gaps fail closed during production promotion. Remaining work is PostgreSQL breadth, remote object storage, and broader object-primary reads.
 
 Test checklist for the same branch:
 
@@ -1217,10 +1304,10 @@ Test checklist for the same branch:
 - Backend parity tests insert the same logical submission, object ref, audit event, credit event, derived record, vector entry, export manifest, export manifest item, and tombstone through the shared store trait for both backends. libSQL coverage exists; PostgreSQL integration coverage still needs an available test database.
 - Tenant-isolation tests seed duplicate `submission_id`, `trace_id`, `canonical_summary_hash`, and contributor pseudonym under two tenants and prove all public store methods filter by tenant. Implemented for the libSQL store contract, PostgreSQL store facade, and ingest DB mirror path, including rejection coverage for export manifest items and derived records that try to link cross-tenant object, derived, or vector refs.
 - Handler-level tests drive the future ingest/review/revoke/export callers, not only helper predicates, and assert each mocked DB/object/vector call receives `tenant_id`, `actor_principal_ref`, and `submission_id`. Implemented for submit/review/credit/revoke dual-write, DB-backed export selection, and maintenance-triggered vector metadata indexing.
-- Revocation and retention propagation tests prove tombstone-first ordering and invalidation of submissions, derived rows, vectors, benchmark artifacts, exports, and credit settlement. Current coverage verifies DB tombstone/status plus object-ref, derived-row, vector-entry, and replay export manifest/item invalidation for newly discovered and already file-marked revocations, plus retention-expired DB submission/object/derived/export invalidation; benchmark settlement tests remain future work.
+- Revocation and retention propagation tests prove tombstone-first ordering and invalidation of submissions, derived rows, vectors, benchmark artifacts, exports, and credit settlement. Current coverage verifies DB tombstone/status plus object-ref, derived-row, vector-entry, replay export manifest/item invalidation, exact delayed-credit settlement reversal for newly discovered and already file-marked revocations, service-local submitted/review/vector/benchmark/ranker object-payload deletion, and retention-expired DB submission/object/derived/export invalidation; broader benchmark settlement tests remain future work.
 - Retention tests run dry-run, policy-change, legal-hold, retry, and resumed-job paths before any destructive object/vector deletion path is enabled.
 - Export tests prove revoked, quarantined, rejected, expired, and out-of-scope submissions cannot enter new manifests, and existing manifests are invalidated after source revocation.
-- Security tests verify PostgreSQL RLS with `app.tenant_id` and libSQL query scoping with same ids across tenants.
+- Security tests verify PostgreSQL RLS with `tracedao.trace_tenant_id` and libSQL query scoping with same ids across tenants.
 - Migration rollback tests prove DB-first reads can be disabled without deleting rows and that audit/tombstone rows remain append-only.
 
 ## Rollback
@@ -1256,8 +1343,8 @@ The trusted tenant id comes from authentication. Production request handling sho
 PostgreSQL policy model:
 
 - Enable row-level security on all `trace_*` tables except global policy dictionaries.
-- Set a transaction-local tenant setting such as `ironclaw.trace_tenant_id` after authentication.
-- Add `USING (tenant_id = current_setting('ironclaw.trace_tenant_id', true))` and matching `WITH CHECK` policies for tenant rows.
+- Set a transaction-local tenant setting such as `tracedao.trace_tenant_id` after authentication.
+- Add `USING (tenant_id = current_setting('tracedao.trace_tenant_id', true))` and matching `WITH CHECK` policies for tenant rows.
 - Give service-worker roles narrow policies for only their job type.
 - Keep admin cross-tenant access behind explicit system-scope methods that always emit audit events.
 
@@ -1275,7 +1362,7 @@ Tenant isolation tests:
 - Reviewer/admin token for tenant A cannot access tenant B quarantine, analytics, audit, object refs, vectors, exports, or credit ledger rows.
 - Same `submission_id`, `trace_id`, `canonical_summary_hash`, and contributor pseudonym can exist in two tenants without collisions.
 - DB-backed queries include tenant predicates at the caller level, not just in low-level helpers.
-- PostgreSQL RLS tests run with `ironclaw.trace_tenant_id` set to tenant A and confirm tenant B rows are invisible.
+- PostgreSQL RLS tests run with `tracedao.trace_tenant_id` set to tenant A and confirm tenant B rows are invisible.
 - libSQL integration tests use a shared database with two tenants and assert every public repository method scopes by tenant.
 
 Revocation propagation tests:

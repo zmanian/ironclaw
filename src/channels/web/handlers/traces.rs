@@ -13,22 +13,19 @@ use uuid::Uuid;
 
 use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
+use crate::trace_client::{TraceClientHost, TraceClientScope};
 use crate::trace_contribution::{
-    ConsentScope, CreditSummary, DeterministicTraceRedactor, LocalTraceSubmissionRecord,
-    RawTraceContribution, RecordedTraceContributionOptions, StandingTraceContributionPolicy,
-    TRACE_CREDIT_NOTICE_MAX_SNOOZE_HOURS, TraceChannel, TraceContributionAcceptance,
-    TraceContributionEnvelope, TraceContributionPolicyRejection, TraceCreditReport,
-    TraceQueueDiagnostics, TraceQueueFlushReport, TraceQueueHold, TraceRedactor,
-    acknowledge_trace_credit_notice_for_scope, apply_credit_estimate_to_envelope,
-    capture_turns_from_conversation_messages, flush_trace_contribution_queue_for_scope,
+    ConsentScope, CreditSummary, LocalTraceSubmissionRecord, RecordedTraceContributionOptions,
+    StandingTraceContributionPolicy, TRACE_CREDIT_NOTICE_MAX_SNOOZE_HOURS, TraceChannel,
+    TraceContributionAcceptance, TraceContributionEnvelope, TraceContributionPolicyRejection,
+    TraceCreditReport, TraceQueueDiagnostics, TraceQueueFlushReport, TraceQueueHold,
+    acknowledge_trace_credit_notice_for_scope, capture_turns_from_conversation_messages,
     local_pseudonymous_contributor_id, local_pseudonymous_tenant_scope_ref,
     mark_trace_credit_notice_due_for_scope, preflight_trace_contribution_policy,
-    queue_trace_envelope_for_scope, queued_trace_envelope_paths_for_scope,
-    read_local_trace_records_for_scope, read_trace_policy_for_scope,
+    queued_trace_envelope_paths_for_scope, read_trace_policy_for_scope,
     read_trace_queue_holds_for_scope, revoke_trace_submission_for_scope_with_policy,
-    snooze_trace_credit_notice_for_scope, sync_remote_trace_submission_records_for_scope,
-    trace_credit_report, trace_credit_summary, trace_queue_diagnostics_for_scope,
-    write_trace_policy_for_scope,
+    snooze_trace_credit_notice_for_scope, trace_credit_report, trace_credit_summary,
+    trace_queue_diagnostics_for_scope, write_trace_policy_for_scope,
 };
 
 #[derive(Debug, Deserialize)]
@@ -306,8 +303,11 @@ pub async fn traces_preview_handler(
     )
     .await?;
 
+    let trace_host = TraceClientHost;
+    let trace_scope = TraceClientScope::user(user.user_id.as_str());
     let queued = if body.enqueue {
-        queue_trace_envelope_for_scope(Some(user.user_id.as_str()), &envelope)
+        trace_host
+            .queue_envelope_for_scope(&trace_scope, &envelope)
             .map_err(internal_error)?;
         true
     } else {
@@ -354,12 +354,16 @@ pub async fn traces_submit_handler(
         },
     )
     .await?;
-    queue_trace_envelope_for_scope(Some(user.user_id.as_str()), &envelope)
+    let trace_host = TraceClientHost;
+    let trace_scope = TraceClientScope::user(user.user_id.as_str());
+    trace_host
+        .queue_envelope_for_scope(&trace_scope, &envelope)
         .map_err(internal_error)?;
 
     let flush_report = if body.flush {
         Some(
-            flush_trace_contribution_queue_for_scope(Some(user.user_id.as_str()), 25)
+            trace_host
+                .flush_scope_queue(&trace_scope, 25)
                 .await
                 .map_err(internal_error)?,
         )
@@ -381,25 +385,26 @@ pub async fn traces_flush_handler(
     AuthenticatedUser(user): AuthenticatedUser,
     Query(query): Query<TraceQueueFlushQuery>,
 ) -> Result<Json<TraceQueueFlushReport>, (StatusCode, String)> {
-    let report = flush_trace_contribution_queue_for_scope(
-        Some(user.user_id.as_str()),
-        query.limit.unwrap_or(25).clamp(1, 100),
-    )
-    .await
-    .map_err(internal_error)?;
+    let trace_host = TraceClientHost;
+    let trace_scope = TraceClientScope::user(user.user_id.as_str());
+    let report = trace_host
+        .flush_scope_queue(&trace_scope, query.limit.unwrap_or(25).clamp(1, 100))
+        .await
+        .map_err(internal_error)?;
     Ok(Json(report))
 }
 
 pub async fn traces_credit_handler(
     AuthenticatedUser(user): AuthenticatedUser,
 ) -> Result<Json<TraceCreditResponse>, (StatusCode, String)> {
-    if let Err(error) =
-        sync_remote_trace_submission_records_for_scope(Some(user.user_id.as_str())).await
-    {
+    let trace_host = TraceClientHost;
+    let trace_scope = TraceClientScope::user(user.user_id.as_str());
+    if let Err(error) = trace_host.sync_remote_records_for_scope(&trace_scope).await {
         tracing::debug!(%error, "Failed to sync Trace Commons credit before web credit response");
     }
-    let records =
-        read_local_trace_records_for_scope(Some(user.user_id.as_str())).map_err(internal_error)?;
+    let records = trace_host
+        .read_local_records_for_scope(&trace_scope)
+        .map_err(internal_error)?;
     let summary = trace_credit_summary(&records);
     let report = trace_credit_report(&records);
     Ok(Json(TraceCreditResponse {
@@ -412,9 +417,9 @@ pub async fn traces_credit_handler(
 pub async fn traces_credit_notice_handler(
     AuthenticatedUser(user): AuthenticatedUser,
 ) -> Result<Json<TraceCreditNoticeResponse>, (StatusCode, String)> {
-    if let Err(error) =
-        sync_remote_trace_submission_records_for_scope(Some(user.user_id.as_str())).await
-    {
+    let trace_host = TraceClientHost;
+    let trace_scope = TraceClientScope::user(user.user_id.as_str());
+    if let Err(error) = trace_host.sync_remote_records_for_scope(&trace_scope).await {
         tracing::debug!(%error, "Failed to sync Trace Commons credit before web credit notice response");
     }
     let credit_notice = mark_trace_credit_notice_due_for_scope(Some(user.user_id.as_str()))
@@ -471,13 +476,14 @@ pub async fn traces_queue_status_handler(
 pub async fn traces_submissions_handler(
     AuthenticatedUser(user): AuthenticatedUser,
 ) -> Result<Json<Vec<LocalTraceSubmissionRecord>>, (StatusCode, String)> {
-    if let Err(error) =
-        sync_remote_trace_submission_records_for_scope(Some(user.user_id.as_str())).await
-    {
+    let trace_host = TraceClientHost;
+    let trace_scope = TraceClientScope::user(user.user_id.as_str());
+    if let Err(error) = trace_host.sync_remote_records_for_scope(&trace_scope).await {
         tracing::debug!(%error, "Failed to sync Trace Commons credit before web submissions response");
     }
-    let records =
-        read_local_trace_records_for_scope(Some(user.user_id.as_str())).map_err(internal_error)?;
+    let records = trace_host
+        .read_local_records_for_scope(&trace_scope)
+        .map_err(internal_error)?;
     Ok(Json(records))
 }
 
@@ -558,11 +564,10 @@ async fn build_redacted_trace_envelope(
         credit_account_ref: None,
     };
 
-    let raw = RawTraceContribution::from_capture_turns(&capture_turns, capture_options);
-    let redactor = DeterministicTraceRedactor::default();
-    let mut envelope = redactor.redact_trace(raw).await.map_err(internal_error)?;
-    apply_credit_estimate_to_envelope(&mut envelope);
-    Ok(envelope)
+    TraceClientHost
+        .build_envelope_from_capture_turns(&capture_turns, capture_options, None)
+        .await
+        .map_err(internal_error)
 }
 
 async fn resolve_trace_thread_id(
@@ -650,8 +655,10 @@ mod tests {
     use crate::channels::web::auth::UserIdentity;
     use crate::llm::recording::{TraceFile, TraceResponse, TraceStep, TraceToolCall};
     use crate::trace_contribution::{
-        LocalTraceSubmissionStatus, TraceCreditEvent, TraceCreditEventKind, TraceQueueWarningKind,
-        trace_contribution_dir_for_scope, write_trace_policy_for_scope,
+        DeterministicTraceRedactor, LocalTraceSubmissionStatus, RawTraceContribution,
+        TraceCreditEvent, TraceCreditEventKind, TraceQueueWarningKind, TraceRedactor,
+        queue_trace_envelope_for_scope, trace_contribution_dir_for_scope,
+        write_trace_policy_for_scope,
     };
     use chrono::Utc;
 

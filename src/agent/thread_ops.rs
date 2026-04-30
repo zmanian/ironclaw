@@ -166,17 +166,6 @@ fn pending_approval_message(pending: Option<&PendingApproval>) -> String {
     }
 }
 
-fn trace_channel_from_agent_channel(channel: &str) -> crate::trace_contribution::TraceChannel {
-    match channel {
-        "gateway" | "web" => crate::trace_contribution::TraceChannel::Web,
-        "cli" | "repl" | "tui" => crate::trace_contribution::TraceChannel::Cli,
-        "telegram" => crate::trace_contribution::TraceChannel::Telegram,
-        "slack" => crate::trace_contribution::TraceChannel::Slack,
-        "routine" | "heartbeat" => crate::trace_contribution::TraceChannel::Routine,
-        _ => crate::trace_contribution::TraceChannel::Other,
-    }
-}
-
 fn trace_turn_outcome_success() -> serde_json::Value {
     serde_json::json!({
         "schema_version": TRACE_TURN_OUTCOME_SCHEMA_VERSION,
@@ -213,119 +202,6 @@ fn classify_trace_failure_mode(error_message: &str) -> &'static str {
     } else {
         "runtime_failure"
     }
-}
-
-fn parse_trace_failure_mode(value: &str) -> crate::trace_contribution::TraceFailureMode {
-    match value {
-        "environment_or_auth_failure" => {
-            crate::trace_contribution::TraceFailureMode::EnvironmentOrAuthFailure
-        }
-        "unrecoverable_tool_failure" => {
-            crate::trace_contribution::TraceFailureMode::UnrecoverableToolFailure
-        }
-        "premature_termination" => {
-            crate::trace_contribution::TraceFailureMode::PrematureTermination
-        }
-        other => crate::trace_contribution::TraceFailureMode::Other(other.to_string()),
-    }
-}
-
-fn merge_trace_outcome_value(
-    outcome: &serde_json::Value,
-    aggregate: &mut crate::trace_contribution::OutcomeMetadata,
-) {
-    match outcome.get("task_success").and_then(|v| v.as_str()) {
-        Some("failure") => {
-            aggregate.task_success = crate::trace_contribution::TaskSuccess::Failure;
-        }
-        Some("success")
-            if aggregate.task_success == crate::trace_contribution::TaskSuccess::Unknown =>
-        {
-            aggregate.task_success = crate::trace_contribution::TaskSuccess::Success;
-        }
-        Some("partial")
-            if !matches!(
-                aggregate.task_success,
-                crate::trace_contribution::TaskSuccess::Failure
-            ) =>
-        {
-            aggregate.task_success = crate::trace_contribution::TaskSuccess::Partial;
-        }
-        _ => {}
-    }
-
-    if let Some(values) = outcome.get("error_taxonomy").and_then(|v| v.as_array()) {
-        for value in values.iter().filter_map(|v| v.as_str()) {
-            let value = value.to_string();
-            if !aggregate.error_taxonomy.contains(&value) {
-                aggregate.error_taxonomy.push(value);
-            }
-        }
-    }
-
-    if let Some(values) = outcome.get("failure_modes").and_then(|v| v.as_array()) {
-        for value in values.iter().filter_map(|v| v.as_str()) {
-            let mode = parse_trace_failure_mode(value);
-            if !aggregate.failure_modes.contains(&mode) {
-                aggregate.failure_modes.push(mode);
-            }
-        }
-    }
-}
-
-fn capture_turns_from_conversation_messages_with_outcomes(
-    messages: &[crate::history::ConversationMessage],
-) -> (
-    Vec<crate::trace_contribution::RawTraceCaptureTurn>,
-    crate::trace_contribution::OutcomeMetadata,
-) {
-    let mut turns = crate::trace_contribution::capture_turns_from_conversation_messages(messages);
-    let mut aggregate = crate::trace_contribution::OutcomeMetadata::default();
-    let mut turn_index = 0usize;
-    let mut iter = messages.iter().peekable();
-
-    while let Some(message) = iter.next() {
-        if message.role != "user" {
-            continue;
-        }
-
-        if let Some(next) = iter.peek()
-            && next.role == "tool_calls"
-            && let Some(tool_message) = iter.next()
-            && let Ok(serde_json::Value::Object(obj)) =
-                serde_json::from_str::<serde_json::Value>(&tool_message.content)
-            && let Some(outcome) = obj.get("outcome")
-        {
-            if let Some(state) = outcome.get("state").and_then(|v| v.as_str())
-                && let Some(turn) = turns.get_mut(turn_index)
-            {
-                turn.state = Some(state.to_string());
-            }
-            merge_trace_outcome_value(outcome, &mut aggregate);
-        }
-
-        if let Some(next) = iter.peek()
-            && next.role == "assistant"
-        {
-            let _ = iter.next();
-        }
-
-        turn_index += 1;
-    }
-
-    if aggregate.task_success == crate::trace_contribution::TaskSuccess::Unknown {
-        for turn in &turns {
-            if matches!(turn.state.as_deref(), Some("Failed" | "failed")) {
-                aggregate.task_success = crate::trace_contribution::TaskSuccess::Failure;
-                break;
-            }
-            if turn.response.is_some() {
-                aggregate.task_success = crate::trace_contribution::TaskSuccess::Success;
-            }
-        }
-    }
-
-    (turns, aggregate)
 }
 
 #[cfg(test)]
@@ -1151,8 +1027,11 @@ impl Agent {
         let channels = Arc::clone(&self.channels);
 
         tokio::spawn(async move {
+            let trace_host = crate::trace_client::TraceClientHost;
+            let trace_scope = crate::trace_client::TraceClientScope::user(user_id.clone());
+
             let policy = match crate::trace_contribution::read_trace_policy_for_scope(Some(
-                &user_id,
+                trace_scope.as_str(),
             )) {
                 Ok(policy) => policy,
                 Err(error) => {
@@ -1160,16 +1039,9 @@ impl Agent {
                     return;
                 }
             };
-            if let Err(error) = crate::trace_contribution::preflight_trace_contribution_policy(
-                &policy,
-                crate::trace_contribution::TraceContributionAcceptance::AutonomousSubmit,
-            ) {
-                tracing::debug!(%error, %thread_id, "Skipping autonomous trace contribution by policy");
-                return;
-            }
 
             let owned = match store
-                .conversation_belongs_to_user(thread_id, &user_id)
+                .conversation_belongs_to_user(thread_id, trace_scope.as_str())
                 .await
             {
                 Ok(owned) => owned,
@@ -1181,7 +1053,7 @@ impl Agent {
             if !owned {
                 tracing::warn!(
                     %thread_id,
-                    user_id = %user_id,
+                    user_id = %trace_scope.as_str(),
                     "Skipping autonomous trace contribution for unowned thread"
                 );
                 return;
@@ -1197,96 +1069,66 @@ impl Agent {
                     return;
                 }
             };
-            let (mut turns, persisted_outcome) =
-                capture_turns_from_conversation_messages_with_outcomes(&messages);
-            if turns.is_empty() {
-                return;
-            }
-            if turns.len() > 5 {
-                turns = turns.split_off(turns.len() - 5);
-            }
 
-            let options = crate::trace_contribution::RecordedTraceContributionOptions {
-                include_message_text: policy.include_message_text,
-                include_tool_payloads: policy.include_tool_payloads,
-                consent_scopes: vec![policy.default_scope],
-                channel: trace_channel_from_agent_channel(&channel),
-                engine_version: None,
-                feature_flags: Default::default(),
-                pseudonymous_contributor_id: Some(
-                    crate::trace_contribution::local_pseudonymous_contributor_id(&user_id),
-                ),
-                tenant_scope_ref: Some(
-                    crate::trace_contribution::local_pseudonymous_tenant_scope_ref(&user_id),
-                ),
-                credit_account_ref: None,
-            };
-            let mut raw = crate::trace_contribution::RawTraceContribution::from_capture_turns(
-                &turns, options,
-            );
-            if persisted_outcome.task_success != crate::trace_contribution::TaskSuccess::Unknown {
-                raw.outcome = persisted_outcome;
-            }
-            let redactor = crate::trace_contribution::DeterministicTraceRedactor::default();
-            let mut envelope = match crate::trace_contribution::TraceRedactor::redact_trace(
-                &redactor, raw,
-            )
-            .await
+            let envelope = match trace_host
+                .prepare_autonomous_envelope_from_messages(
+                    crate::trace_client::TraceClientAutonomousCaptureRequest {
+                        scope: trace_scope.clone(),
+                        channel: crate::trace_client::trace_channel_from_host_channel(&channel),
+                        messages: &messages,
+                        policy: &policy,
+                        max_turns: 5,
+                    },
+                )
+                .await
             {
-                Ok(envelope) => envelope,
-                Err(error) => {
-                    tracing::debug!(%error, %thread_id, "Failed to redact autonomous trace");
-                    return;
+                Ok(crate::trace_client::TraceClientAutonomousCaptureOutcome::Submit(envelope)) => {
+                    Some(*envelope)
                 }
-            };
-            crate::trace_contribution::apply_credit_estimate_to_envelope(&mut envelope);
-
-            match crate::trace_contribution::trace_autonomous_eligibility(&envelope, &policy) {
-                crate::trace_contribution::TraceQueueEligibility::Submit => {
-                    if let Err(error) = crate::trace_contribution::queue_trace_envelope_for_scope(
-                        Some(&user_id),
-                        &envelope,
-                    ) {
-                        tracing::debug!(%error, %thread_id, "Failed to queue autonomous trace");
-                        return;
-                    }
-                }
-                crate::trace_contribution::TraceQueueEligibility::Hold { reason } => {
+                Ok(crate::trace_client::TraceClientAutonomousCaptureOutcome::Held {
+                    submission_id,
+                    reason,
+                }) => {
                     tracing::debug!(
                         %thread_id,
-                        submission_id = %envelope.submission_id,
+                        %submission_id,
                         reason = %reason,
                         "Skipping autonomous trace queue by trace contribution policy"
                     );
+                    None
                 }
+                Ok(crate::trace_client::TraceClientAutonomousCaptureOutcome::Skipped) => return,
+                Err(error) => {
+                    tracing::debug!(%error, %thread_id, "Failed to build autonomous trace envelope");
+                    return;
+                }
+            };
+
+            if let Some(envelope) = envelope
+                && let Err(error) = trace_host.queue_envelope_for_scope(&trace_scope, &envelope)
+            {
+                tracing::debug!(%error, %thread_id, "Failed to queue autonomous trace");
+                return;
             }
 
-            match crate::trace_contribution::flush_trace_contribution_queue_for_scope(
-                Some(&user_id),
-                10,
-            )
-            .await
-            {
+            match trace_host.flush_scope_queue(&trace_scope, 10).await {
                 Ok(_report) => {}
                 Err(error) => {
                     tracing::debug!(%error, %thread_id, "Failed to flush autonomous trace queue");
                 }
             }
 
-            let pending =
-                match crate::trace_contribution::pending_trace_credit_notice_outbox_items_for_scope(
-                    Some(&user_id),
-                ) {
-                    Ok(pending) => pending,
-                    Err(error) => {
-                        tracing::debug!(
-                            %error,
-                            %thread_id,
-                            "Failed to read autonomous trace credit notice outbox"
-                        );
-                        return;
-                    }
-                };
+            let pending = match trace_host.pending_credit_notice_outbox_items(&trace_scope) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        %thread_id,
+                        "Failed to read autonomous trace credit notice outbox"
+                    );
+                    return;
+                }
+            };
             for item in pending {
                 match channels
                     .send_status(
@@ -1297,13 +1139,11 @@ impl Agent {
                     .await
                 {
                     Ok(()) => {
-                        if let Err(error) =
-                            crate::trace_contribution::record_trace_credit_notice_delivery_success_for_scope(
-                                Some(&user_id),
-                                &item.fingerprint,
-                                &channel,
-                            )
-                        {
+                        if let Err(error) = trace_host.record_credit_notice_delivery_success(
+                            &trace_scope,
+                            &item.fingerprint,
+                            &channel,
+                        ) {
                             tracing::debug!(
                                 %error,
                                 %thread_id,
@@ -1317,14 +1157,12 @@ impl Agent {
                             %thread_id,
                             "Failed to send autonomous trace credit notice"
                         );
-                        if let Err(record_error) =
-                            crate::trace_contribution::record_trace_credit_notice_delivery_failure_for_scope(
-                                Some(&user_id),
-                                &item.fingerprint,
-                                &channel,
-                                &error.to_string(),
-                            )
-                        {
+                        if let Err(record_error) = trace_host.record_credit_notice_delivery_failure(
+                            &trace_scope,
+                            &item.fingerprint,
+                            &channel,
+                            &error.to_string(),
+                        ) {
                             tracing::debug!(
                                 %record_error,
                                 %thread_id,
@@ -3205,7 +3043,8 @@ mod tests {
             ),
         ];
 
-        let (turns, outcome) = capture_turns_from_conversation_messages_with_outcomes(&messages);
+        let (turns, outcome) =
+            crate::trace_client::capture_turns_from_conversation_messages_with_outcomes(&messages);
 
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].state.as_deref(), Some("Completed"));
@@ -3483,7 +3322,8 @@ mod tests {
             .list_conversation_messages(thread_id)
             .await
             .expect("list persisted messages");
-        let (turns, outcome) = capture_turns_from_conversation_messages_with_outcomes(&messages);
+        let (turns, outcome) =
+            crate::trace_client::capture_turns_from_conversation_messages_with_outcomes(&messages);
 
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].state.as_deref(), Some("Completed"));
@@ -3524,7 +3364,8 @@ mod tests {
             .list_conversation_messages(thread_id)
             .await
             .expect("list persisted messages");
-        let (turns, outcome) = capture_turns_from_conversation_messages_with_outcomes(&messages);
+        let (turns, outcome) =
+            crate::trace_client::capture_turns_from_conversation_messages_with_outcomes(&messages);
 
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].state.as_deref(), Some("Failed"));

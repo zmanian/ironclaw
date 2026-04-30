@@ -16,6 +16,23 @@ Trace Commons is an opt-in pipeline for contributing locally redacted IronClaw t
 - Deterministic text redaction preserves safe within-trace structure with stable placeholders such as `<PRIVATE_EMAIL_1>` and `<PRIVATE_LOCAL_PATH_1>` instead of flattening every entity to the same token.
 - A local Privacy Filter sidecar can be enabled with `IRONCLAW_TRACE_PRIVACY_FILTER_COMMAND` and optional whitespace-split `IRONCLAW_TRACE_PRIVACY_FILTER_ARGS`. The sidecar receives `{"text":"..."}` on stdin and must return Privacy Filter-style JSON on stdout. IronClaw keeps only the safe `redacted_text` and aggregate summary. The sidecar is launched with a cleared environment except `PATH`, `LANG`, and `LC_ALL`; `IRONCLAW_TRACE_PRIVACY_FILTER_TIMEOUT_MS`, `IRONCLAW_TRACE_PRIVACY_FILTER_MAX_INPUT_BYTES`, `IRONCLAW_TRACE_PRIVACY_FILTER_MAX_STDOUT_BYTES`, and `IRONCLAW_TRACE_PRIVACY_FILTER_MAX_STDERR_BYTES` tune local guardrails.
 
+## Reborn Client Boundary
+
+Client-side Trace Commons code follows the Reborn product/host split tracked in
+nearai/ironclaw#2987. Agent runtime, web handlers, and CLI helpers should route
+local capture, redaction, queue writes, queue flushes, status sync, local record
+reads, and credit-notice delivery through `crate::trace_client::TraceClientHost`
+instead of constructing raw contribution/redactor/queue flows inline. The
+lower-level `trace_contribution` module remains the local implementation detail
+behind that host facade.
+
+`TraceClientHost` is still local-first: it only builds redacted
+`ironclaw.trace_contribution.v1` envelopes, manages scoped local queues and
+submission records, and talks to the configured private ingestion endpoint or
+upload-claim issuer. Hosted corpus storage, review/admin state, DB/object
+storage, and production worker control-plane logic live in the public
+`zmanian/tracedao-server` repository.
+
 ## CLI MVP
 
 ```bash
@@ -62,14 +79,16 @@ ironclaw traces opt-out
 
 The static submit token is read from `IRONCLAW_TRACE_SUBMIT_TOKEN` by default. The token is not stored in the policy file. Hosted deployments can instead configure an upload-claim issuer in the standing policy. Queue flush, explicit `traces submit --envelope`, remote status sync, and remote revoke then request short-lived bearer claims from the HTTPS issuer, require exact issuer-host allowlisting, reject embedded URL credentials/query/fragment/internal targets, require the returned claim to be an EdDSA/Ed25519 JWT with a `kid`, cache it only in process memory until its refresh margin, and retry once with a forced refresh after a 401/403 from submit, status-sync, or revoke calls. Optional workload credentials for the issuer stay in the configured environment variable and are never written to the policy. `preview --enqueue` and `enqueue --envelope` use the same standing-policy gate as autonomous flush: the policy must be enabled, must have an ingestion endpoint, and must allow any message text or tool payloads already present in the redacted envelope. Plain `preview` remains local and does not require opt-in.
 
-## Private Ingestion Service MVP
+## TraceDAO Server Ingestion Service
 
-The repository includes a local private-corpus ingestion binary for development and internal deployments:
+Hosted ingest/review/admin/worker service code now lives in the private
+`zmanian/tracedao-server` repository. From that repository, local development
+and internal deployments can run:
 
 ```bash
 TRACE_COMMONS_TENANT_TOKENS='tenant-a:dev-token-a;expires_at=2026-04-27T00:00:00Z,tenant-a:reviewer:review-token-a,tenant-a:export_worker:export-token-a,tenant-b:dev-token-b' \
 TRACE_COMMONS_BIND='127.0.0.1:3907' \
-cargo run --bin trace_commons_ingest
+cargo run --bin tracedao-ingest
 ```
 
 Token entries may use `tenant_id:token` for contributor access or
@@ -232,7 +251,7 @@ TRACE_COMMONS_TENANT_POLICIES='{
     "allowed_uses": ["debugging", "evaluation", "benchmark_generation", "aggregate_analytics"]
   }
 }' \
-cargo run --bin trace_commons_ingest
+cargo run --bin tracedao-ingest
 ```
 
 Tenants without an explicit entry keep the development default so existing local
@@ -274,14 +293,14 @@ Optional dark-launch storage can be enabled for internal pilots:
 TRACE_COMMONS_DB_DUAL_WRITE=true \
 DATABASE_BACKEND=libsql \
 LIBSQL_PATH=/var/lib/ironclaw/ironclaw.db \
-cargo run --bin trace_commons_ingest
+cargo run --bin tracedao-ingest
 
 # Optionally serve contributor credit/status endpoints from that DB mirror.
 TRACE_COMMONS_DB_DUAL_WRITE=true \
 TRACE_COMMONS_DB_CONTRIBUTOR_READS=true \
 DATABASE_BACKEND=libsql \
 LIBSQL_PATH=/var/lib/ironclaw/ironclaw.db \
-cargo run --bin trace_commons_ingest
+cargo run --bin tracedao-ingest
 
 # Optionally serve reviewer metadata views from that DB mirror.
 # Production-like rollouts can add TRACE_COMMONS_DB_REVIEWER_REQUIRE_OBJECT_REFS=true.
@@ -289,28 +308,28 @@ TRACE_COMMONS_DB_DUAL_WRITE=true \
 TRACE_COMMONS_DB_REVIEWER_READS=true \
 DATABASE_BACKEND=libsql \
 LIBSQL_PATH=/var/lib/ironclaw/ironclaw.db \
-cargo run --bin trace_commons_ingest
+cargo run --bin tracedao-ingest
 
 # Optionally select replay exports from DB metadata.
 TRACE_COMMONS_DB_DUAL_WRITE=true \
 TRACE_COMMONS_DB_REPLAY_EXPORT_READS=true \
 DATABASE_BACKEND=libsql \
 LIBSQL_PATH=/var/lib/ironclaw/ironclaw.db \
-cargo run --bin trace_commons_ingest
+cargo run --bin tracedao-ingest
 
 # Fail closed when benchmark/ranker export sources lack active submitted-envelope object refs.
 TRACE_COMMONS_DB_DUAL_WRITE=true \
 TRACE_COMMONS_DERIVED_EXPORT_REQUIRE_OBJECT_REFS=true \
 DATABASE_BACKEND=libsql \
 LIBSQL_PATH=/var/lib/ironclaw/ironclaw.db \
-cargo run --bin trace_commons_ingest
+cargo run --bin tracedao-ingest
 
 # Optionally serve reviewer audit reads from the DB mirror.
 TRACE_COMMONS_DB_DUAL_WRITE=true \
 TRACE_COMMONS_DB_AUDIT_READS=true \
 DATABASE_BACKEND=libsql \
 LIBSQL_PATH=/var/lib/ironclaw/ironclaw.db \
-cargo run --bin trace_commons_ingest
+cargo run --bin tracedao-ingest
 
 # Fail maintenance closed when DB/file reconciliation reports promotion-blocking gaps.
 # Use with admin maintenance requests that set reconcile_db_mirror: true.
@@ -318,22 +337,22 @@ TRACE_COMMONS_DB_DUAL_WRITE=true \
 TRACE_COMMONS_REQUIRE_DB_RECONCILIATION_CLEAN=true \
 DATABASE_BACKEND=libsql \
 LIBSQL_PATH=/var/lib/ironclaw/ironclaw.db \
-cargo run --bin trace_commons_ingest
+cargo run --bin tracedao-ingest
 
 # Pause retention expiration/purge for selected central retention policy IDs.
 TRACE_COMMONS_LEGAL_HOLD_RETENTION_POLICIES=private_corpus_revocable,benchmark_revocable \
-cargo run --bin trace_commons_ingest
+cargo run --bin tracedao-ingest
 
 # Store submitted redacted envelopes in the encrypted local artifact sidecar.
 TRACE_COMMONS_ARTIFACT_KEY_HEX=<ironclaw-secrets-compatible-hex-key> \
 TRACE_COMMONS_ARTIFACT_DIR=/var/lib/ironclaw/trace-artifacts \
-cargo run --bin trace_commons_ingest
+cargo run --bin tracedao-ingest
 
 # Prefer the service-owned local object-store backend for production-shaped pilots.
 TRACE_COMMONS_OBJECT_STORE=local_service \
 TRACE_COMMONS_ARTIFACT_KEY_HEX=<ironclaw-secrets-compatible-hex-key> \
 TRACE_COMMONS_SERVICE_OBJECT_STORE_DIR=/var/lib/ironclaw/trace-object-store \
-cargo run --bin trace_commons_ingest
+cargo run --bin tracedao-ingest
 
 # Skip plaintext submitted/reviewed envelope body files for submit/review pilots.
 TRACE_COMMONS_DB_DUAL_WRITE=true \
@@ -346,7 +365,7 @@ TRACE_COMMONS_ARTIFACT_KEY_HEX=<ironclaw-secrets-compatible-hex-key> \
 TRACE_COMMONS_SERVICE_OBJECT_STORE_DIR=/var/lib/ironclaw/trace-object-store \
 DATABASE_BACKEND=libsql \
 LIBSQL_PATH=/var/lib/ironclaw/ironclaw.db \
-cargo run --bin trace_commons_ingest
+cargo run --bin tracedao-ingest
 
 # Require replay export body reads through service-local DB object refs.
 TRACE_COMMONS_DB_DUAL_WRITE=true \
@@ -359,7 +378,7 @@ TRACE_COMMONS_ARTIFACT_KEY_HEX=<ironclaw-secrets-compatible-hex-key> \
 TRACE_COMMONS_SERVICE_OBJECT_STORE_DIR=/var/lib/ironclaw/trace-object-store \
 DATABASE_BACKEND=libsql \
 LIBSQL_PATH=/var/lib/ironclaw/ironclaw.db \
-cargo run --bin trace_commons_ingest
+cargo run --bin tracedao-ingest
 
 # Skip plaintext benchmark/ranker artifact and provenance files.
 TRACE_COMMONS_DB_DUAL_WRITE=true \
@@ -373,10 +392,10 @@ TRACE_COMMONS_ARTIFACT_KEY_HEX=<ironclaw-secrets-compatible-hex-key> \
 TRACE_COMMONS_SERVICE_OBJECT_STORE_DIR=/var/lib/ironclaw/trace-object-store \
 DATABASE_BACKEND=libsql \
 LIBSQL_PATH=/var/lib/ironclaw/ironclaw.db \
-cargo run --bin trace_commons_ingest
+cargo run --bin tracedao-ingest
 ```
 
-`TRACE_COMMONS_DB_DUAL_WRITE=true` builds a `TraceCorpusStore` mirror from the normal `DATABASE_BACKEND` configuration. `DATABASE_BACKEND=postgres` requires `DATABASE_URL`; `DATABASE_BACKEND=libsql` uses `LIBSQL_PATH` with optional `LIBSQL_URL` and `LIBSQL_AUTH_TOKEN`. The mirror writes tenant-scoped submissions, tenant policies, tenant access grants, object refs, derived precheck records, export manifest metadata, export manifest item snapshots, audit events, credit events, review state, revocation tombstones, and retention maintenance job/item ledger rows, including redaction-count aggregates and derived summary/tool/coverage metadata needed for DB-backed reviewer/export/analytics paths. By default, pilot API reads still use the file-backed store. `TRACE_COMMONS_DB_TENANT_POLICY_READS=true` switches submission and export policy lookup to DB-backed `trace_tenant_policies`; combine it with `TRACE_COMMONS_REQUIRE_TENANT_SUBMISSION_POLICY=true` to fail closed when no tenant policy exists. `TRACE_COMMONS_REQUIRE_TENANT_ACCESS_GRANTS=true` requires DB dual-write and makes trace submission, contributor credit reads, contributor credit-event reads, and contributor submission-status sync fail closed unless `trace_tenant_access_grants` contains an active exact-role row for the authenticated tenant/principal; any grant allow-lists narrow the effective consent/use policy before envelope validation proceeds. Admin-token reads and writes through `/v1/admin/tenant-policy` append hash-chained file audit events and mirror safe DB audit metadata with policy version, allow-list counts, and a policy projection hash. Admin-token reads, creates, and revocations through `/v1/admin/tenant-access-grants` are tenant-scoped and mirror safe DB audit metadata with the action, role/status, allow-list counts, and a grant projection hash. Admin-token reads through `/v1/admin/config-status` expose only safe cutover booleans, schema version, DB/object-store configured status, configured legal-hold policy IDs, the max export item cap, submission quota limits, the object-store provider alias, tenant rollout allowlist counts, and PostgreSQL Trace Commons RLS readiness counts when the DB backend can report them; the RLS status now separates policy readiness from `FORCE ROW LEVEL SECURITY` readiness and reports only table-count/name diagnostics, not row data. Set `TRACE_COMMONS_REQUIRE_POSTGRES_TRACE_RLS_READY=true` with `TRACE_COMMONS_DB_DUAL_WRITE=true` and `DATABASE_BACKEND=postgres` to fail startup unless every Trace Commons table has the tenant policy installed, RLS enabled, FORCE RLS enabled, matching policy expressions, and a runtime role that does not bypass RLS. The response omits roots, tokens, paths, secrets, tenant ids, row contents, and tenant policy contents while still writing a read audit event. `TRACE_COMMONS_DB_CONTRIBUTOR_READS=true` switches `/v1/contributors/me/credit`, `/v1/contributors/me/credit-events`, and `/v1/contributors/me/submission-status` to the DB mirror; it requires DB dual-write/backfill to be configured and preserves tenant plus principal filtering. `TRACE_COMMONS_DB_REVIEWER_READS=true` switches reviewer/admin metadata reads for analytics, trace listing, quarantine queue, active-learning queue, benchmark candidate conversion, ranker candidate/pair exports, review decisions, and review lease claim/release state to the DB mirror. Review leases are tenant-scoped, bound to the authenticated reviewer/admin principal, may be reclaimed by the same principal or after expiration, and are cleared automatically when a trace leaves quarantine. Review decisions are allowed only for live quarantined submissions: accepted/rejected/revoked/expired/purged submissions are rejected before any envelope body is read, and approvals are blocked for aggregate-only retention classes that do not permit derived corpus artifacts. Review decisions resolve envelope bodies through active DB object refs first; compatibility mode may fall back to a file-backed body only when file metadata is still present, while DB-sourced submissions with no file metadata require an active submitted-envelope object ref and do not recreate the missing file metadata row. Set `TRACE_COMMONS_DB_REVIEWER_REQUIRE_OBJECT_REFS=true` with DB reviewer reads to make all DB-backed review decisions fail closed when no active submitted-envelope object ref exists. `TRACE_COMMONS_DB_REPLAY_EXPORT_READS=true` switches replay export eligibility and derived metadata selection to the DB mirror, then attempts to resolve submitted envelope bodies through a shared replay body-read policy/audit helper that verifies tenant scope, object ref ownership, artifact kind, and content hash for DB object refs, including the encrypted local artifact sidecar. Compatibility mode falls back to the file-backed envelope body if no active DB object ref exists. Set `TRACE_COMMONS_DB_REPLAY_EXPORT_REQUIRE_OBJECT_REFS=true` with DB replay export reads to fail closed instead. `TRACE_COMMONS_DERIVED_EXPORT_REQUIRE_OBJECT_REFS=true` requires DB dual-write and makes benchmark conversion plus ranker candidate/pair exports fail closed unless every selected source has an active submitted-envelope object ref that can be tenant/hash verified before artifacts, provenance, or utility credit are published. `TRACE_COMMONS_DB_AUDIT_READS=true` switches `/v1/audit/events` to the DB mirror. Each global DB read/object-ref gate has a comma-separated tenant allowlist companion for canary promotion: `TRACE_COMMONS_DB_CONTRIBUTOR_READS_TENANT_IDS`, `TRACE_COMMONS_DB_REVIEWER_READS_TENANT_IDS`, `TRACE_COMMONS_DB_REVIEWER_REQUIRE_OBJECT_REFS_TENANT_IDS`, `TRACE_COMMONS_DB_REPLAY_EXPORT_READS_TENANT_IDS`, `TRACE_COMMONS_DB_REPLAY_EXPORT_REQUIRE_OBJECT_REFS_TENANT_IDS`, `TRACE_COMMONS_DB_AUDIT_READS_TENANT_IDS`, `TRACE_COMMONS_DB_TENANT_POLICY_READS_TENANT_IDS`, and `TRACE_COMMONS_DERIVED_EXPORT_REQUIRE_OBJECT_REFS_TENANT_IDS`; dependency gates must cover the same tenants before fail-closed object-ref or object-primary modes can be enabled. Maintenance reconciliation reports reader-projection parity for contributor credit/status/events, reviewer metadata, analytics, audit event counts, and replay/export manifest summaries so operators can check each read flag before promotion; it also reports file/DB credit-ledger and canonical audit-event ID gaps so operators can distinguish count parity from missing mirrored rows. Reconciliation responses include `blocking_gaps`, a compact machine-readable list of promotion blockers. Set `TRACE_COMMONS_REQUIRE_DB_RECONCILIATION_CLEAN=true` after dual-write/backfill parity looks stable to reject maintenance requests that omit `reconcile_db_mirror: true` with `400 Bad Request` and to fail closed with `409 Conflict` when reconciliation still reports promotion-blocking gaps. Requests that ask for reconciliation without a configured DB mirror return `503 Service Unavailable`. Audit-chain verification also includes a DB mirror report that checks previous-hash continuity, recomputes hashes for canonical mirrored payloads, and compares DB action/metadata projections against those payloads; derived diagnostics compare file/DB presence, status, canonical-summary hashes, and active derived rows attached to invalid sources; export diagnostics split DB manifests into replay, benchmark, ranker, and other counts, flag manifest items missing source object refs, and report active export manifests/items still referencing invalid sources; object-ref diagnostics distinguish missing/unreadable bodies from content-hash integrity mismatches; and vector diagnostics flag accepted/current canonical summaries that still need active vector entries.
+`TRACE_COMMONS_DB_DUAL_WRITE=true` is now a hosted TraceDAO server concern in the public `zmanian/tracedao-server` repo. That server owns the `TraceCorpusStore` DB facade, PostgreSQL/libSQL schemas, RLS diagnostics, DB-backed read flags, object-ref gates, and encrypted object-store provider code. Ironclaw keeps the local trace contribution envelope/client behavior and no longer carries the Trace Commons DB/object-storage modules or migrations.
 
 Set `TRACE_COMMONS_REQUIRE_DB_MIRROR_WRITES=true` during production cutover after DB dual-write parity checks pass. It requires `TRACE_COMMONS_DB_DUAL_WRITE=true` and makes submission, revocation, review decision, credit, replay export manifest, benchmark/ranker provenance, audit, and trace-content-read mirror failures return an internal error instead of silently continuing with file-only state. Submission, delayed-credit, replay export manifest, benchmark provenance, benchmark lifecycle, and ranker provenance mirror failures also avoid publishing local file-side metadata/object, ledger, replay-manifest, artifact/provenance, or staged service-local encrypted artifact objects for the failed operation. If a final export audit mirror fails after export metadata was staged, required mode removes the replay/benchmark/ranker file artifacts and deletes the DB export manifest/items/object refs for that export. Replay, benchmark, and ranker export DB mirrors write manifest metadata, export artifact object refs, and manifest item snapshots through one backend transaction so an item/reference validation failure does not leave a partial DB export.
 
@@ -384,7 +403,7 @@ Set `TRACE_COMMONS_REQUIRE_DB_MIRROR_WRITES=true` during production cutover afte
 
 `TRACE_COMMONS_ANALYTICS_MIN_CELL_COUNT` optionally suppresses aggregate analytics cells whose count is below the configured threshold. The endpoint still returns content-free totals and reports `min_cell_count` plus `suppressed_cell_count` so reviewers know a privacy threshold was applied.
 
-`TRACE_COMMONS_ARTIFACT_KEY_HEX` enables encrypted trace object storage. `TRACE_COMMONS_ENCRYPTED_ARTIFACTS=true` can be used as an explicit guard for the legacy encrypted artifact sidecar, but still requires the key. `TRACE_COMMONS_OBJECT_STORE=local_service` selects the production-shaped service-owned local backend and records DB object refs with the `trace_commons_service_local_encrypted` provider alias. That mode uses `TRACE_COMMONS_SERVICE_OBJECT_STORE_DIR` when set, otherwise `TRACE_COMMONS_ARTIFACT_DIR`, otherwise `TRACE_COMMONS_DATA_DIR/service_object_store`. In both encrypted modes, submitted redacted envelopes, benchmark conversion artifacts, and ranker export provenance manifests are encrypted with IronClaw secrets crypto, stored under a tenant-hashed artifact directory, and referenced by DB object refs. The local backend now sits behind the `TraceArtifactStore` provider trait so remote object/KMS-backed providers can share the same serialized JSON write/read/delete contract later. File-backed submission records retain envelope receipts so envelope reads resolve through encrypted object storage when present; benchmark/ranker export manifest items carry per-source object refs to the shared export artifact or provenance object. `TRACE_COMMONS_OBJECT_PRIMARY_SUBMIT_REVIEW=true` is a production-shaped submit/review cutover guard: it requires DB dual-write, required DB mirror writes, DB reviewer reads, reviewer object-ref reads, and `TRACE_COMMONS_OBJECT_STORE=local_service`, then omits the plaintext submitted/reviewed envelope body files while still writing compatibility metadata, derived records, and file audit rows. `TRACE_COMMONS_OBJECT_PRIMARY_REPLAY_EXPORT=true` is the replay-export companion guard: it requires DB dual-write, required DB mirror writes, DB replay export reads, replay object-ref-required reads, and the service-local object store, then makes replay body exports use the existing DB object-ref path without file fallback. `TRACE_COMMONS_OBJECT_PRIMARY_DERIVED_EXPORTS=true` is the benchmark/ranker companion guard: it requires DB dual-write, required DB mirror writes, DB reviewer reads, required derived source object refs, export guardrails, and the service-local object store, then stores benchmark artifacts and ranker provenance only in encrypted object storage while keeping DB manifest/items as the durable index for purpose filters and lifecycle invalidation. The object-primary guards also accept `TRACE_COMMONS_OBJECT_PRIMARY_SUBMIT_REVIEW_TENANT_IDS`, `TRACE_COMMONS_OBJECT_PRIMARY_REPLAY_EXPORT_TENANT_IDS`, and `TRACE_COMMONS_OBJECT_PRIMARY_DERIVED_EXPORTS_TENANT_IDS` for tenant-by-tenant promotion behind the same dependency checks.
+`TRACE_COMMONS_ARTIFACT_KEY_HEX`, `TRACE_COMMONS_OBJECT_STORE`, and the object-primary cutover flags are now implemented in `zmanian/tracedao-server`. Ironclaw docs keep these names only as operator context for the separated hosted service; the server repo is the source of truth for DB object refs, encrypted artifact storage, and remote object/KMS provider evolution.
 
 Then opt a client into that endpoint:
 
@@ -471,8 +490,8 @@ credentials, and a stricter managed-keyset flag that accepts only active
 issuer/keyset EdDSA keys with `kid` headers. Guarded HTTPS issuer-managed
 keysets refresh live after startup with last-good preservation and optional
 max-stale fail-closed enforcement.
-The standalone `trace_commons_upload_claim_issuer` binary is the first
-production-shaped issuer service for hosted tenants. It exposes `POST
+The standalone `tracedao-upload-claim-issuer` binary in `zmanian/tracedao-server`
+is the first production-shaped issuer service for hosted tenants. It exposes `POST
 /v1/trace-upload-claim`, `GET /health`, and `GET
 /.well-known/trace-commons-ed25519-keyset.json`; authenticates workload tokens
 with EdDSA/Ed25519 only; rejects RSA key material; signs short-lived contributor
@@ -508,7 +527,7 @@ On submit, the service also writes a derived redacted-only record with:
 - coverage tags for channel, tool, tool category, outcome, failure mode, and privacy risk
 - aggregate analytics by status, privacy risk, task success, tool, tool category, and coverage tag
 
-The current API remains intentionally file-backed under `TRACE_COMMONS_DATA_DIR` or `~/.ironclaw/trace_commons_ingest` for compatibility and easy local operation, with optional DB-backed read flags for contributor, reviewer metadata, replay/export selection, and audit surfaces. This branch also includes the first production storage bridge: optional DB dual-write metadata, optional encrypted local artifact storage, object-primary submit/review mode that avoids plaintext envelope body files while retaining file-backed metadata/audit compatibility records, a durable DB revocation-propagation ledger for downstream invalidation/retry work, and a fail-closed reconciliation gate for promotion jobs. `TRACE_COMMONS_OBJECT_STORE=remote_service` is a disabled production scaffold that requires remote provider/bucket/KMS/credential-reference configuration and refuses plaintext compatibility fallback until a real service-owned remote object-store backend is wired. PostgreSQL RLS policy migration V31 now covers the tenant-scoped Trace Commons metadata tables without enabling `FORCE ROW LEVEL SECURITY` by default; config-status can report catalog-only RLS readiness, including policy counts, expression mismatches, disabled tables, force-RLS counts, force-RLS missing tables, whether the current role bypasses RLS, and a stricter production-ready boolean. Production deployments can set `TRACE_COMMONS_REQUIRE_POSTGRES_TRACE_RLS_READY=true` to fail startup unless the configured PostgreSQL database is fully ready for RLS as an active tenant boundary. Production deployments still need transaction-local tenant context through every DB-backed runtime path before RLS can become the active trust boundary. Production deployments should finish promoting reviewer/export/analytics paths into DB/object-primary reads and move encrypted artifacts behind remote service-owned object storage before broad rollout.
+The hosted API remains intentionally file-backed by default for compatibility and easy local operation, with optional DB-backed read/write flags for controlled rollout. That API and its storage implementation now live in `zmanian/tracedao-server`; Ironclaw no longer carries the Trace Commons DB/object-store schema or backend code.
 
 ## Production Hardening Roadmap
 
@@ -668,7 +687,7 @@ The web settings panel includes a Trace Commons tab for standing opt-in, autonom
 | Quarantine/review workflow | Partial | Reviewer/admin routes can list and decide on quarantined redacted traces; quarantine and active-learning queue items expose reviewer SLA/escalation metadata (`review_age_hours`, `review_escalation_state`, and `review_escalation_reasons`) plus optional DB-backed review lease assignment fields for prioritized triage; queue reads can filter lease state with `all`, `mine`, `available`, `active`, or `expired`; review decisions require a non-empty reason, cannot bypass another active reviewer lease, and are rejected for non-quarantined, terminal, expired, or aggregate-only approval records before trace content is read; with DB reviewer reads enabled, reviewers/admins can claim or release durable tenant/principal-scoped leases, review decisions resolve submitted-envelope bodies through active DB object refs when available, can be configured to require active object refs, emit content-read audit rows, and mirror the reviewed envelope body as a fresh `review_snapshot` object ref without reclassifying the original submitted envelope; object-primary submit/review mode can also skip plaintext submitted/reviewed envelope body files. Production still needs richer assignment policy, batch actions, and central reviewer routing. |
 | Replay dataset export | Partial | Approved redacted slices can be exported by reviewer/admin tokens, production-like deployments can require explicit accepted/low-risk/consent-scoped export guardrails for replay, benchmark, and ranker-training exports plus caller-supplied export purposes and active DB object refs for body reads, tenant policy allowed-use ABAC gates replay/benchmark/ranker requests and source selection, and each export call site now goes through a short-lived tenant/principal/purpose/dataset-kind access-grant check before building replay, benchmark, or ranker slices. DB metadata can drive replay export selection, benchmark/ranker exports can fail closed when selected sources lack active submitted-envelope object refs, submitted envelope bodies can resolve through active DB object refs for file or encrypted local artifact stores, object-primary replay export mode can require service-local DB object refs with no file fallback, manifests carry source-list hashes mirrored into audit `decision_inputs_hash`, replay/benchmark/ranker exports mirror durable one-shot grant rows plus running/complete export job rows, replay exports mirror compact DB manifest rows and per-source item snapshots with source object refs plus invalidation timestamps, benchmark/ranker item rows link derived refs, active vector refs when indexed, and per-source object refs to file-backed or service-local encrypted benchmark/ranker artifacts, reviewer/admins can list replay manifest metadata, and each exported trace body read emits a tenant-scoped audit event. Production needs persistent background export workers, remote object storage, broader bulk export controls, and execution of revocation propagation for already-published artifacts. |
 | Analytics summary | Partial | Aggregate counts by status/risk/tool/coverage exist, including content-free process-evaluation aggregates for evaluated trace count, labels, rubric ratings, and score bands. Deployments can set a minimum cell-count threshold to suppress rare aggregate buckets before responses leave the service. Production still needs fuller privacy-budget accounting if exposed broadly. |
-| Production relational DB and encrypted object storage | Partial | V25-V38 PostgreSQL schema plus libSQL schema slices, shared `TraceCorpusStore`, both backend implementations, optional ingest DB mirror with contributor, tenant policy, reviewer metadata, durable review lease fields, replay selection reads, policy-gated DB object-ref-backed replay envelope reads, vector-entry metadata, compact replay export manifest metadata, replay export item snapshots, durable retention job/item ledger rows, durable revocation-propagation item rows, backend-enforced same-tenant/submission checks for derived object refs, vector-entry derived refs, and export item derived/object/vector refs, benchmark/ranker export artifact object refs, atomic export manifest/object-ref/item mirror writes across libSQL and PostgreSQL with rollback coverage for invalid item references, canonical audit payloads for DB verifier recomputation, DB-native audit append ordering, encrypted local artifact sidecar, `TraceArtifactStore` provider trait, service-owned local encrypted object-store mode, disabled remote-service object-store config scaffold, tenant-allowlisted rollout gates for DB reads/object-ref requirements/object-primary modes, object-primary submit/review mode for plaintext-free envelope body storage, object-primary replay export object-ref read mode, service-local submitted/review envelope physical-delete execution from revocation-propagation items, maintenance-triggered DB mirror backfill for submissions plus existing file-side credit/audit/replay-manifest rows with isolated per-item failure reporting, derived presence/status/hash/invalid-source diagnostics, file/DB credit-ledger and canonical audit-event ID gap diagnostics, split export-manifest kind diagnostics, export item object-ref and invalid-source diagnostics, separate object-ref presence/readability/hash-mismatch diagnostics, vector index gap diagnostics, reader-projection parity diagnostics, initial PostgreSQL tenant RLS policies, and safe PostgreSQL RLS readiness diagnostics exist. Remote object storage implementation, parity enforcement, `FORCE RLS`/service role policy hardening, and broader object-primary reads remain. |
+| Production relational DB and encrypted object storage | Split to TraceDAO server | The DB/object-store schema, `TraceCorpusStore`, PostgreSQL/libSQL backends, RLS diagnostics, encrypted local artifact store, and storage tests now live in the public `zmanian/tracedao-server` repo. Ironclaw keeps local contribution capture and client-side upload/status behavior. |
 | Central audit log | Partial | File-backed audit rows now include optional hash-chain fields plus a maintenance verifier while preserving legacy JSONL compatibility, DB audit rows mirror those chain hashes and canonical hash payloads for file-backed events, and PostgreSQL/libSQL audit rows now carry tenant-scoped `audit_sequence` values assigned inside serialized append transactions that reject stale hash-chain predecessors. Maintenance emits a DB mirror report that checks hash-field format, previous-hash linkage, canonical-payload hash recomputation, DB action/metadata projection drift, and file/DB canonical audit-event ID gaps for mirrored rows. Audit routes and optional DB audit reads cover core submit/review/credit/revoke mutations, contributor credit/status reads with aggregate item counts, retention/purge artifact invalidations, tenant policy admin reads/writes, reviewer analytics/list/review-queue/audit-log reads, dataset/benchmark/ranker exports, per-trace replay export content reads, process-evaluation writes, and per-source derived-summary reads for benchmark conversion, ranker candidate/pair exports, and vector indexing. `object_ref_id` is mirrored when the body is read through a DB object ref; derived-summary read rows carry only safe surface/purpose/source identifiers. Privileged delayed credit, process-evaluation writes, review lease claim/release operations, and tenant policy mutations now mirror typed safe metadata with bounded values and hashes rather than raw request bodies. |
 | Retention enforcement | Partial | Submit records persist retention policy ids and expiry timestamps; maintenance and the dedicated retention worker route mark expired submissions and derived records, mirror DB expiration/artifact/export-manifest invalidation with typed action-count audit rows and durable retention job/item ledger rows when configured, prune cached exports that reference expired sources, skip expiration/purge for operator-configured legal-hold retention policy IDs, and can explicitly purge expired file/encrypted local artifact copies by cutoff only when non-dry-run purge requests carry a non-empty purpose. Production still needs service-owned object storage deletion workflows. |
 | Revocation propagation to derived artifacts | Partial | Current revocation marks local/file status, mirrors DB status, writes tenant-scoped first-writer-wins tombstones with redaction/canonical-summary hashes when available, authorizes DB-only revocation against the original contributor or reviewer/admin principal, rejects same-tenant re-ingest matching retained file-backed or DB-mirrored tombstone submission ids, redaction hashes, or canonical-summary hashes, invalidates DB-mirrored object refs, derived precheck rows, vector metadata entries, replay export manifest rows, replay export item rows, file-backed benchmark/ranker provenance manifests, and published benchmark artifacts by moving their registry state to revoked and evaluation state to inconclusive, blocks file-backed replay export, applies the same DB invalidation path when maintenance discovers an existing file-backed revocation tombstone or already file-marked revoked submission, and can physically delete service-local encrypted submitted/review envelope payloads from exact tenant-scoped object-ref revocation items while marking unsupported stores/artifact kinds as skipped. Production must invalidate external benchmark registries and worker caches. |

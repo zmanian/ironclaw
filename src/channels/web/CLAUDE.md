@@ -110,6 +110,8 @@ Extension lifecycle note:
 
 The static UI exposes these through Settings → Trace Commons for standing opt-in/credit/revocation and through the chat composer Trace button for per-thread redacted preview and queueing. That settings tab also includes an internal reviewer/operator panel that calls a user-configured private ingestion service directly from the browser with a pasted reviewer/admin bearer token. The token is intentionally session-only and is not persisted by the static UI.
 
+Client-local Trace Commons handlers should route redaction, queue writes, queue flushes, status sync, and local record reads through `crate::trace_client::TraceClientHost`. The operator panel remains API-mediated through the configured private TraceDAO service and must not reintroduce server-side storage/control-plane code into the web gateway.
+
 Private ingestion service routes used by the operator panel:
 | Method | Path | Description |
 |--------|------|-------------|
@@ -120,6 +122,8 @@ Private ingestion service routes used by the operator panel:
 | GET | `/v1/review/quarantine` | Reviewer/admin quarantine queue |
 | GET | `/v1/review/active-learning` | Reviewer/admin active-learning review queue |
 | POST | `/v1/review/{submission_id}/decision` | Approve/reject quarantined trace |
+| POST | `/v1/review/leases/claim-next` | Claim the next prioritized available DB-backed review lease |
+| POST | `/v1/review/leases/claim-batch` | Claim a bounded batch of prioritized available DB-backed review leases |
 | POST/DELETE | `/v1/review/{submission_id}/lease` | Claim or release a DB-backed review lease |
 | POST | `/v1/review/{submission_id}/credit-events` | Append delayed credit event |
 | GET | `/v1/datasets/replay` | Export approved replay dataset slice |
@@ -129,12 +133,14 @@ Private ingestion service routes used by the operator panel:
 | GET | `/v1/ranker/training-pairs` | Export approved ranker training pairs |
 | GET | `/v1/admin/retention/jobs` | Admin-only DB-backed retention maintenance job ledger |
 | GET | `/v1/admin/retention/jobs/{retention_job_id}/items` | Admin-only per-submission retention job actions |
+| GET | `/v1/admin/operational-summary` | Admin-only aggregate operational counts for submissions, review SLA, exports, retention, vectors, and delayed credit |
 | POST | `/v1/admin/maintenance` | Run tenant-scoped revocation propagation and export-cache maintenance |
 | GET | `/v1/audit/events` | List tenant audit events when available |
 
 The operator panel must keep calls API-mediated through the configured private ingestion service and degrade cleanly on `404`/`501` for older deployments that do not yet expose the newer operator endpoints.
 The panel includes read-only config status, replay manifest, and retention ledger actions for `/v1/admin/config-status`, `/v1/datasets/replay/manifests`, `/v1/admin/retention/jobs`, and `/v1/admin/retention/jobs/{retention_job_id}/items`; it uses the session-only admin token and never persists the retention job id or bearer credential.
 Reviewer queues accept `lease_filter=all|mine|available|active|expired` for assignment-aware triage. Review lease claims POST `{ lease_ttl_seconds?: i64, review_due_at?: RFC3339 DateTime<Utc> }` to `/v1/review/{submission_id}/lease`; claim/release responses include tenant and trace identifiers plus review assignment, lease expiration, and due-at fields for operator confirmation.
+Claim-next review leases POST `{ lease_ttl_seconds?: i64, review_due_at?: RFC3339 DateTime<Utc>, privacy_risk?: low|medium|high }` to `/v1/review/leases/claim-next` and return the same lease confirmation shape. Claim-batch adds `{ limit?: usize }` at `/v1/review/leases/claim-batch` and returns aggregate claim counts plus per-lease confirmations. Operational summaries are safe aggregate rollups only: they expose tenant/storage refs and counts by status/state/category, not submission payloads, raw trace content, or per-item identifiers.
 
 ### User Management (admin — requires `admin` role, see `docs/USER_MANAGEMENT_API.md`)
 | Method | Path | Description |

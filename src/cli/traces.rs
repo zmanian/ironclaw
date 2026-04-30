@@ -14,18 +14,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::trace_client::{TraceClientHost, TraceClientScope};
 use crate::trace_contribution::{
-    ConsentScope, CreditSummary, DeterministicTraceRedactor, RecordedTraceContributionOptions,
-    StandingTraceContributionPolicy, TraceChannel, TraceContributionAcceptance,
-    TraceContributionEnvelope, TraceCreditEvent, TraceCreditEventKind, TraceRedactor,
-    TraceSubmissionReceipt, TraceSubmissionStatusUpdate, acknowledge_trace_credit_notice_for_scope,
-    estimate_initial_credit, fetch_trace_submission_statuses_with_policy,
-    flush_trace_contribution_queue_for_scope, mark_trace_credit_notice_due_for_scope,
+    ConsentScope, CreditSummary, RecordedTraceContributionOptions, StandingTraceContributionPolicy,
+    TraceChannel, TraceContributionAcceptance, TraceContributionEnvelope, TraceCreditEvent,
+    TraceCreditEventKind, TraceSubmissionReceipt, TraceSubmissionStatusUpdate,
+    acknowledge_trace_credit_notice_for_scope, estimate_initial_credit,
+    fetch_trace_submission_statuses_with_policy, mark_trace_credit_notice_due_for_scope,
     preflight_trace_contribution_policy, privacy_filter_adapter_from_env,
-    read_local_trace_records_for_scope, read_trace_policy_for_scope,
-    revoke_trace_submission_at_endpoint_with_policy, snooze_trace_credit_notice_for_scope,
-    submit_trace_envelope_to_endpoint_with_policy, trace_credit_summary,
-    trace_queue_diagnostics_for_scope, trace_submission_status_endpoint,
+    read_trace_policy_for_scope, revoke_trace_submission_at_endpoint_with_policy,
+    snooze_trace_credit_notice_for_scope, submit_trace_envelope_to_endpoint_with_policy,
+    trace_credit_summary, trace_queue_diagnostics_for_scope, trace_submission_status_endpoint,
 };
 
 #[derive(Subcommand, Debug, Clone)]
@@ -334,6 +333,64 @@ pub enum TracesCommand {
         /// Optional RFC3339 review due timestamp
         #[arg(long)]
         review_due_at: Option<String>,
+
+        /// Environment variable containing a reviewer/admin bearer token
+        #[arg(long, default_value = "IRONCLAW_TRACE_SUBMIT_TOKEN")]
+        bearer_token_env: String,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Claim the next available DB-backed central trace review lease
+    ReviewLeaseClaimNext {
+        /// Trace Commons ingestion base URL or /v1/traces URL
+        #[arg(long)]
+        endpoint: String,
+
+        /// Optional lease TTL in seconds
+        #[arg(long)]
+        lease_ttl_seconds: Option<i64>,
+
+        /// Optional RFC3339 review due timestamp
+        #[arg(long)]
+        review_due_at: Option<String>,
+
+        /// Optional residual privacy risk filter
+        #[arg(long, value_enum)]
+        privacy_risk: Option<TracePrivacyRiskArg>,
+
+        /// Environment variable containing a reviewer/admin bearer token
+        #[arg(long, default_value = "IRONCLAW_TRACE_SUBMIT_TOKEN")]
+        bearer_token_env: String,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Claim a bounded batch of available DB-backed central trace review leases
+    ReviewLeaseClaimBatch {
+        /// Trace Commons ingestion base URL or /v1/traces URL
+        #[arg(long)]
+        endpoint: String,
+
+        /// Maximum number of leases to claim
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Optional lease TTL in seconds
+        #[arg(long)]
+        lease_ttl_seconds: Option<i64>,
+
+        /// Optional RFC3339 review due timestamp
+        #[arg(long)]
+        review_due_at: Option<String>,
+
+        /// Optional residual privacy risk filter
+        #[arg(long, value_enum)]
+        privacy_risk: Option<TracePrivacyRiskArg>,
 
         /// Environment variable containing a reviewer/admin bearer token
         #[arg(long, default_value = "IRONCLAW_TRACE_SUBMIT_TOKEN")]
@@ -905,6 +962,21 @@ pub enum TracesCommand {
         /// Environment variable containing an admin bearer token
         #[arg(long, default_value = "IRONCLAW_TRACE_SUBMIT_TOKEN")]
         bearer_token_env: String,
+    },
+
+    /// Show safe aggregate Trace Commons operational rollout counts
+    OperationalSummary {
+        /// Trace Commons ingestion base URL or /v1/traces URL
+        #[arg(long)]
+        endpoint: String,
+
+        /// Environment variable containing an admin bearer token
+        #[arg(long, default_value = "IRONCLAW_TRACE_SUBMIT_TOKEN")]
+        bearer_token_env: String,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Read the DB-backed tenant contribution policy
@@ -2014,6 +2086,44 @@ pub async fn run_traces_command(cmd: TracesCommand) -> anyhow::Result<()> {
             })
             .await
         }
+        TracesCommand::ReviewLeaseClaimNext {
+            endpoint,
+            lease_ttl_seconds,
+            review_due_at,
+            privacy_risk,
+            bearer_token_env,
+            json,
+        } => {
+            trace_commons_review_lease_claim_next(TraceCommonsReviewLeaseClaimNextOptions {
+                endpoint: &endpoint,
+                bearer_token_env: &bearer_token_env,
+                lease_ttl_seconds,
+                review_due_at,
+                privacy_risk,
+                json,
+            })
+            .await
+        }
+        TracesCommand::ReviewLeaseClaimBatch {
+            endpoint,
+            limit,
+            lease_ttl_seconds,
+            review_due_at,
+            privacy_risk,
+            bearer_token_env,
+            json,
+        } => {
+            trace_commons_review_lease_claim_batch(TraceCommonsReviewLeaseClaimBatchOptions {
+                endpoint: &endpoint,
+                bearer_token_env: &bearer_token_env,
+                limit,
+                lease_ttl_seconds,
+                review_due_at,
+                privacy_risk,
+                json,
+            })
+            .await
+        }
         TracesCommand::ReviewLeaseRelease {
             endpoint,
             submission_id,
@@ -2363,6 +2473,11 @@ pub async fn run_traces_command(cmd: TracesCommand) -> anyhow::Result<()> {
             endpoint,
             bearer_token_env,
         } => trace_commons_config_status(&endpoint, &bearer_token_env).await,
+        TracesCommand::OperationalSummary {
+            endpoint,
+            bearer_token_env,
+            json,
+        } => trace_commons_operational_summary(&endpoint, &bearer_token_env, json).await,
         TracesCommand::TenantPolicyGet {
             endpoint,
             bearer_token_env,
@@ -2995,7 +3110,14 @@ fn trace_queue_status_diagnostics(
             .as_deref()
             .is_none_or(|env| env.trim().is_empty() || std::env::var_os(env).is_some());
     let queue = trace_queue_diagnostics_for_scope(scope_ref)?;
-    let local_records = read_local_trace_records_for_scope(scope_ref)?;
+    let trace_host = TraceClientHost;
+    let local_records = match scope_ref {
+        Some(scope) => {
+            let trace_scope = TraceClientScope::raw(scope);
+            trace_host.read_local_records_for_scope(&trace_scope)?
+        }
+        None => trace_host.read_local_records_for_default()?,
+    };
 
     Ok(TraceQueueStatusDiagnostics {
         scope: normalized_scope,
@@ -3049,24 +3171,23 @@ async fn preview_recorded_trace(options: PreviewOptions) -> anyhow::Result<()> {
             )
         })?;
 
-    let raw_contribution = crate::trace_contribution::RawTraceContribution::from_recorded_trace(
-        &recorded_trace,
-        RecordedTraceContributionOptions {
-            include_message_text: options.include_message_text,
-            include_tool_payloads: options.include_tool_payloads,
-            consent_scopes: vec![options.scope.into()],
-            channel: options.channel.into(),
-            engine_version: options.engine_version,
-            feature_flags: BTreeMap::new(),
-            pseudonymous_contributor_id: options.contributor_id,
-            tenant_scope_ref: None,
-            credit_account_ref: options.credit_account_ref,
-        },
-    );
-
-    let redactor = DeterministicTraceRedactor::default();
-    let mut envelope = redactor.redact_trace(raw_contribution).await?;
-    apply_credit_estimate(&mut envelope);
+    let trace_host = TraceClientHost;
+    let envelope = trace_host
+        .build_envelope_from_recorded_trace(
+            &recorded_trace,
+            RecordedTraceContributionOptions {
+                include_message_text: options.include_message_text,
+                include_tool_payloads: options.include_tool_payloads,
+                consent_scopes: vec![options.scope.into()],
+                channel: options.channel.into(),
+                engine_version: options.engine_version,
+                feature_flags: BTreeMap::new(),
+                pseudonymous_contributor_id: options.contributor_id,
+                tenant_scope_ref: None,
+                credit_account_ref: options.credit_account_ref,
+            },
+        )
+        .await?;
     let envelope_json = serde_json::to_string_pretty(&envelope)
         .map_err(|e| anyhow::anyhow!("failed to serialize contribution envelope: {}", e))?;
 
@@ -3394,10 +3515,150 @@ async fn trace_commons_review_lease_claim(
     Ok(())
 }
 
+struct TraceCommonsReviewLeaseClaimNextOptions<'a> {
+    endpoint: &'a str,
+    bearer_token_env: &'a str,
+    lease_ttl_seconds: Option<i64>,
+    review_due_at: Option<String>,
+    privacy_risk: Option<TracePrivacyRiskArg>,
+    json: bool,
+}
+
+async fn trace_commons_review_lease_claim_next(
+    options: TraceCommonsReviewLeaseClaimNextOptions<'_>,
+) -> anyhow::Result<()> {
+    let body = trace_commons_review_lease_claim_next_body(
+        options.lease_ttl_seconds,
+        options.review_due_at,
+        options.privacy_risk,
+    )?;
+    let response = trace_commons_api_request(
+        Method::POST,
+        options.endpoint,
+        "/v1/review/leases/claim-next",
+        &[],
+        Some(options.bearer_token_env),
+        Some(body),
+    )
+    .await?;
+    if options.json {
+        print_trace_commons_json(&response)?;
+        return Ok(());
+    }
+
+    if let Some(submission_id) = trace_commons_response_submission_id(response.json.as_ref()) {
+        println!("Claimed next central review lease for {submission_id}");
+    } else {
+        println!("Claimed next central review lease");
+    }
+    print_trace_commons_review_lease_fields(response.json.as_ref());
+    Ok(())
+}
+
+struct TraceCommonsReviewLeaseClaimBatchOptions<'a> {
+    endpoint: &'a str,
+    bearer_token_env: &'a str,
+    limit: Option<usize>,
+    lease_ttl_seconds: Option<i64>,
+    review_due_at: Option<String>,
+    privacy_risk: Option<TracePrivacyRiskArg>,
+    json: bool,
+}
+
+async fn trace_commons_review_lease_claim_batch(
+    options: TraceCommonsReviewLeaseClaimBatchOptions<'_>,
+) -> anyhow::Result<()> {
+    let body = trace_commons_review_lease_claim_batch_body(
+        options.limit,
+        options.lease_ttl_seconds,
+        options.review_due_at,
+        options.privacy_risk,
+    )?;
+    let response = trace_commons_api_request(
+        Method::POST,
+        options.endpoint,
+        "/v1/review/leases/claim-batch",
+        &[],
+        Some(options.bearer_token_env),
+        Some(body),
+    )
+    .await?;
+    if options.json {
+        print_trace_commons_json(&response)?;
+        return Ok(());
+    }
+
+    let claim_count = response
+        .json
+        .as_ref()
+        .and_then(|value| value.get("claim_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    println!("Claimed {claim_count} central review leases");
+    if let Some(claimed) = response
+        .json
+        .as_ref()
+        .and_then(|value| value.get("claimed"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for claim in claimed {
+            print_trace_commons_review_lease_fields(Some(claim));
+        }
+    }
+    Ok(())
+}
+
 fn trace_commons_review_lease_claim_body(
     lease_ttl_seconds: Option<i64>,
     review_due_at: Option<String>,
 ) -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::Value::Object(trace_commons_review_lease_body(
+        lease_ttl_seconds,
+        review_due_at,
+    )?))
+}
+
+fn trace_commons_review_lease_claim_next_body(
+    lease_ttl_seconds: Option<i64>,
+    review_due_at: Option<String>,
+    privacy_risk: Option<TracePrivacyRiskArg>,
+) -> anyhow::Result<serde_json::Value> {
+    let mut body = trace_commons_review_lease_body(lease_ttl_seconds, review_due_at)?;
+    if let Some(privacy_risk) = privacy_risk {
+        body.insert(
+            "privacy_risk".to_string(),
+            serde_json::Value::String(privacy_risk.to_string()),
+        );
+    }
+    Ok(serde_json::Value::Object(body))
+}
+
+fn trace_commons_review_lease_claim_batch_body(
+    limit: Option<usize>,
+    lease_ttl_seconds: Option<i64>,
+    review_due_at: Option<String>,
+    privacy_risk: Option<TracePrivacyRiskArg>,
+) -> anyhow::Result<serde_json::Value> {
+    let mut body = trace_commons_review_lease_body(lease_ttl_seconds, review_due_at)?;
+    if let Some(limit) = limit {
+        if limit == 0 {
+            anyhow::bail!("--limit must be greater than 0");
+        }
+        body.insert("limit".to_string(), serde_json::json!(limit));
+    }
+    if let Some(privacy_risk) = privacy_risk {
+        body.insert(
+            "privacy_risk".to_string(),
+            serde_json::Value::String(privacy_risk.to_string()),
+        );
+    }
+    Ok(serde_json::Value::Object(body))
+}
+
+fn trace_commons_review_lease_body(
+    lease_ttl_seconds: Option<i64>,
+    review_due_at: Option<String>,
+) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
     let mut body = serde_json::Map::new();
     if let Some(lease_ttl_seconds) = lease_ttl_seconds {
         if lease_ttl_seconds <= 0 {
@@ -3419,7 +3680,7 @@ fn trace_commons_review_lease_claim_body(
             serde_json::Value::String(review_due_at),
         );
     }
-    Ok(serde_json::Value::Object(body))
+    Ok(body)
 }
 
 async fn trace_commons_review_lease_release(
@@ -3445,6 +3706,13 @@ async fn trace_commons_review_lease_release(
     println!("Released central review lease for {submission_id}");
     print_trace_commons_review_lease_fields(response.json.as_ref());
     Ok(())
+}
+
+fn trace_commons_response_submission_id(value: Option<&serde_json::Value>) -> Option<&str> {
+    value?
+        .get("submission_id")
+        .and_then(|submission_id| submission_id.as_str())
+        .filter(|submission_id| !submission_id.is_empty())
 }
 
 fn print_trace_commons_review_lease_fields(value: Option<&serde_json::Value>) {
@@ -4595,6 +4863,298 @@ async fn trace_commons_config_status(endpoint: &str, bearer_token_env: &str) -> 
     )
     .await?;
     print_trace_commons_json(&response)
+}
+
+async fn trace_commons_operational_summary(
+    endpoint: &str,
+    bearer_token_env: &str,
+    json: bool,
+) -> anyhow::Result<()> {
+    let response = trace_commons_api_request(
+        Method::GET,
+        endpoint,
+        "/v1/admin/operational-summary",
+        &[],
+        Some(bearer_token_env),
+        None,
+    )
+    .await?;
+    print_trace_commons_operational_summary_response(response, json)
+}
+
+fn print_trace_commons_operational_summary_response(
+    response: TraceCommonsApiResponse,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        print_trace_commons_json(&response)?;
+        return Ok(());
+    }
+    let Some(value) = response.json.as_ref() else {
+        println!("{}", response.body.trim());
+        return Ok(());
+    };
+
+    println!("Trace Commons operational summary:");
+    for line in trace_commons_operational_summary_lines(value) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn trace_commons_operational_summary_lines(value: &serde_json::Value) -> Vec<String> {
+    let mut lines = json_field_lines(
+        value,
+        &[
+            ("  tenant", "tenant_id"),
+            ("  tenant storage ref", "tenant_storage_ref"),
+            ("  generated at", "generated_at"),
+        ],
+    );
+
+    append_operational_summary_section(
+        &mut lines,
+        "  submissions:",
+        value.get("submissions"),
+        &[
+            ("total", "total"),
+            ("accepted", "accepted"),
+            ("quarantined", "quarantined"),
+            ("rejected", "rejected"),
+            ("revoked", "revoked"),
+            ("expired", "expired"),
+            ("purged", "purged"),
+        ],
+        &[
+            ("by_status", "    by_status"),
+            ("by_privacy_risk", "    by_privacy_risk"),
+        ],
+    );
+    append_operational_summary_section(
+        &mut lines,
+        "  review sla:",
+        value.get("review_sla"),
+        &[
+            ("quarantined_total", "quarantined"),
+            ("fresh", "fresh"),
+            ("due", "due"),
+            ("overdue", "overdue"),
+            ("urgent", "urgent"),
+            ("assigned", "assigned"),
+            ("expired_leases", "expired_leases"),
+            ("oldest_age_hours", "oldest_age_hours"),
+        ],
+        &[("by_state", "    by_state")],
+    );
+    append_operational_summary_section(
+        &mut lines,
+        "  export:",
+        value.get("exports").or_else(|| value.get("export")),
+        &[
+            ("db_available", "db_available"),
+            ("manifest_count", "manifests"),
+            ("active_manifest_count", "active"),
+            ("invalidated_manifest_count", "invalidated"),
+            ("deleted_manifest_count", "deleted"),
+            ("total_manifest_items", "items"),
+            ("manifest_item_count", "items"),
+            ("job_count", "jobs"),
+        ],
+        &[
+            ("by_artifact_kind", "    by_artifact_kind"),
+            ("manifests_by_artifact_kind", "    by_artifact_kind"),
+            ("jobs_by_status", "    jobs_by_status"),
+        ],
+    );
+    append_operational_summary_section(
+        &mut lines,
+        "  retention:",
+        value.get("retention"),
+        &[
+            ("db_available", "db_available"),
+            ("job_count", "jobs"),
+            ("dry_run_count", "dry_runs"),
+            ("selected_revoked_total", "selected_revoked"),
+            ("selected_expired_total", "selected_expired"),
+        ],
+        &[("jobs_by_status", "    jobs_by_status")],
+    );
+    append_operational_summary_section(
+        &mut lines,
+        "  vectors:",
+        value.get("vectors"),
+        &[
+            ("db_available", "db_available"),
+            ("entry_count", "entries"),
+            ("active_entries", "active"),
+            ("active_entry_count", "active"),
+            ("invalidated_entries", "invalidated"),
+            ("invalidated_entry_count", "invalidated"),
+            ("deleted_entries", "deleted"),
+            ("deleted_entry_count", "deleted"),
+            ("accepted_current_derived", "accepted_derived"),
+            ("accepted_derived_count", "accepted_derived"),
+            (
+                "accepted_current_derived_with_active_vector",
+                "accepted_derived_with_active_vector",
+            ),
+            (
+                "accepted_derived_with_active_vector_count",
+                "accepted_derived_with_active_vector",
+            ),
+            ("active_coverage_percent", "active_coverage_percent"),
+        ],
+        &[],
+    );
+    append_operational_summary_section(
+        &mut lines,
+        "  delayed credit:",
+        value.get("delayed_credit"),
+        &[
+            ("event_count", "events"),
+            ("points_positive", "positive_points"),
+            ("positive_points", "positive_points"),
+            ("points_negative", "negative_points"),
+            ("negative_points", "negative_points"),
+            ("points_total", "total_points"),
+            ("total_points", "total_points"),
+            ("last_event_at", "last_event_at"),
+        ],
+        &[("by_event_type", "    by_event_type")],
+    );
+    append_operational_summary_promotion_gate_section(&mut lines, value.get("promotion_gates"));
+
+    lines
+}
+
+fn append_operational_summary_promotion_gate_section(
+    lines: &mut Vec<String>,
+    value: Option<&serde_json::Value>,
+) {
+    let Some(map) = value.and_then(serde_json::Value::as_object) else {
+        return;
+    };
+    let mut section = Vec::new();
+    if let Some(line) = compact_json_items(
+        map,
+        "    totals",
+        &[
+            ("ready", "ready"),
+            ("blocking_count", "blocking_count"),
+            ("warning_count", "warning_count"),
+            ("db_mirror_configured", "db_mirror_configured"),
+            ("require_db_mirror_writes", "require_db_mirror_writes"),
+            (
+                "require_db_reconciliation_clean",
+                "require_db_reconciliation_clean",
+            ),
+            (
+                "require_derived_export_object_refs",
+                "require_derived_export_object_refs",
+            ),
+            ("require_export_guardrails", "require_export_guardrails"),
+            (
+                "object_primary_submit_review",
+                "object_primary_submit_review",
+            ),
+            (
+                "object_primary_replay_export",
+                "object_primary_replay_export",
+            ),
+            (
+                "object_primary_derived_exports",
+                "object_primary_derived_exports",
+            ),
+            ("tenant_rollout_gate_count", "tenant_rollout_gate_count"),
+            ("open_review_count", "open_review_count"),
+            ("urgent_review_count", "urgent_review_count"),
+            ("failed_export_job_count", "failed_export_job_count"),
+            ("failed_retention_job_count", "failed_retention_job_count"),
+            ("vector_missing_count", "vector_missing_count"),
+        ],
+    ) {
+        section.push(line);
+    }
+    if let Some(line) = compact_json_array_line("    blocking_gates", map.get("blocking_gates")) {
+        section.push(line);
+    }
+    if let Some(line) = compact_json_array_line("    warning_gates", map.get("warning_gates")) {
+        section.push(line);
+    }
+    if let Some(line) = compact_json_map_line(
+        "    tenant_rollout_gate_counts",
+        map.get("tenant_rollout_gate_counts"),
+    ) {
+        section.push(line);
+    }
+    if section.is_empty() {
+        return;
+    }
+    lines.push("  promotion gates:".to_string());
+    lines.extend(section);
+}
+
+fn append_operational_summary_section(
+    lines: &mut Vec<String>,
+    heading: &str,
+    value: Option<&serde_json::Value>,
+    compact_fields: &[(&str, &str)],
+    map_fields: &[(&str, &str)],
+) {
+    let Some(map) = value.and_then(serde_json::Value::as_object) else {
+        return;
+    };
+    let mut section = Vec::new();
+    if let Some(line) = compact_json_items(map, "    totals", compact_fields) {
+        section.push(line);
+    }
+    for (field, label) in map_fields {
+        if let Some(line) = compact_json_map_line(label, map.get(*field)) {
+            section.push(line);
+        }
+    }
+    if section.is_empty() {
+        return;
+    }
+    lines.push(heading.to_string());
+    lines.extend(section);
+}
+
+fn compact_json_map_line(label: &str, value: Option<&serde_json::Value>) -> Option<String> {
+    let map = value.and_then(serde_json::Value::as_object)?;
+    if map.is_empty() {
+        return None;
+    }
+    let items = map
+        .iter()
+        .map(|(key, value)| format!("{key}={}", compact_json_count_display(value)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!("{label}: {items}"))
+}
+
+fn compact_json_array_line(label: &str, value: Option<&serde_json::Value>) -> Option<String> {
+    let array = value.and_then(serde_json::Value::as_array)?;
+    if array.is_empty() {
+        return None;
+    }
+    let items = array
+        .iter()
+        .filter_map(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .or_else(|| value.as_i64().map(|number| number.to_string()))
+                .or_else(|| value.as_u64().map(|number| number.to_string()))
+                .or_else(|| value.as_bool().map(|flag| flag.to_string()))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if items.is_empty() {
+        None
+    } else {
+        Some(format!("{label}: {items}"))
+    }
 }
 
 async fn trace_commons_tenant_policy_set(
@@ -5773,7 +6333,7 @@ fn compact_response_body(body: &str) -> String {
 }
 
 async fn flush_queue(limit: usize) -> anyhow::Result<()> {
-    let report = flush_trace_contribution_queue_for_scope(None, limit).await?;
+    let report = TraceClientHost.flush_default_queue(limit).await?;
     println!(
         "Autonomous trace queue flush complete: {} submitted, {} held.",
         report.submitted, report.held
@@ -6842,6 +7402,88 @@ mod tests {
     }
 
     #[test]
+    fn review_lease_claim_next_parses_through_cli() {
+        let cli = parse_cli([
+            "ironclaw",
+            "traces",
+            "review-lease-claim-next",
+            "--endpoint",
+            "https://trace.example/internal",
+            "--lease-ttl-seconds",
+            "900",
+            "--review-due-at",
+            "2026-04-26T12:00:00Z",
+            "--privacy-risk",
+            "medium",
+            "--bearer-token-env",
+            "TRACE_COMMONS_REVIEWER_TOKEN",
+            "--json",
+        ]);
+
+        let TracesCommand::ReviewLeaseClaimNext {
+            endpoint,
+            lease_ttl_seconds,
+            review_due_at,
+            privacy_risk,
+            bearer_token_env,
+            json,
+        } = unwrap_traces_command(cli)
+        else {
+            panic!("expected traces review-lease-claim-next command");
+        };
+
+        assert_eq!(endpoint, "https://trace.example/internal");
+        assert_eq!(lease_ttl_seconds, Some(900));
+        assert_eq!(review_due_at.as_deref(), Some("2026-04-26T12:00:00Z"));
+        assert_eq!(privacy_risk, Some(TracePrivacyRiskArg::Medium));
+        assert_eq!(bearer_token_env, "TRACE_COMMONS_REVIEWER_TOKEN");
+        assert!(json);
+    }
+
+    #[test]
+    fn review_lease_claim_batch_parses_through_cli() {
+        let cli = parse_cli([
+            "ironclaw",
+            "traces",
+            "review-lease-claim-batch",
+            "--endpoint",
+            "https://trace.example/internal",
+            "--limit",
+            "5",
+            "--lease-ttl-seconds",
+            "900",
+            "--review-due-at",
+            "2026-04-26T12:00:00Z",
+            "--privacy-risk",
+            "high",
+            "--bearer-token-env",
+            "TRACE_COMMONS_REVIEWER_TOKEN",
+            "--json",
+        ]);
+
+        let TracesCommand::ReviewLeaseClaimBatch {
+            endpoint,
+            limit,
+            lease_ttl_seconds,
+            review_due_at,
+            privacy_risk,
+            bearer_token_env,
+            json,
+        } = unwrap_traces_command(cli)
+        else {
+            panic!("expected traces review-lease-claim-batch command");
+        };
+
+        assert_eq!(endpoint, "https://trace.example/internal");
+        assert_eq!(limit, Some(5));
+        assert_eq!(lease_ttl_seconds, Some(900));
+        assert_eq!(review_due_at.as_deref(), Some("2026-04-26T12:00:00Z"));
+        assert_eq!(privacy_risk, Some(TracePrivacyRiskArg::High));
+        assert_eq!(bearer_token_env, "TRACE_COMMONS_REVIEWER_TOKEN");
+        assert!(json);
+    }
+
+    #[test]
     fn review_lease_release_parses_through_cli() {
         let cli = parse_cli([
             "ironclaw",
@@ -6892,6 +7534,36 @@ mod tests {
     }
 
     #[test]
+    fn review_lease_claim_next_uses_ingest_endpoint() {
+        let url = trace_commons_api_url(
+            "https://trace.example/internal/v1/traces",
+            "/v1/review/leases/claim-next",
+            &[],
+        )
+        .expect("url builds");
+
+        assert_eq!(
+            url,
+            "https://trace.example/internal/v1/review/leases/claim-next"
+        );
+    }
+
+    #[test]
+    fn review_lease_claim_batch_uses_ingest_endpoint() {
+        let url = trace_commons_api_url(
+            "https://trace.example/internal/v1/traces",
+            "/v1/review/leases/claim-batch",
+            &[],
+        )
+        .expect("url builds");
+
+        assert_eq!(
+            url,
+            "https://trace.example/internal/v1/review/leases/claim-batch"
+        );
+    }
+
+    #[test]
     fn review_lease_claim_body_omits_absent_optional_fields() {
         let body = trace_commons_review_lease_claim_body(None, None).expect("body builds");
 
@@ -6919,6 +7591,71 @@ mod tests {
         let due_at_error =
             trace_commons_review_lease_claim_body(None, Some("tomorrow-ish".to_string()))
                 .expect_err("non-RFC3339 due timestamp is rejected");
+        assert!(due_at_error.to_string().contains("RFC3339"));
+    }
+
+    #[test]
+    fn review_lease_claim_next_body_includes_optional_fields() {
+        let body = trace_commons_review_lease_claim_next_body(
+            Some(900),
+            Some("2026-04-26T12:00:00Z".to_string()),
+            Some(TracePrivacyRiskArg::High),
+        )
+        .expect("body builds");
+
+        assert_eq!(body["lease_ttl_seconds"], 900);
+        assert_eq!(body["review_due_at"], "2026-04-26T12:00:00Z");
+        assert_eq!(body["privacy_risk"], "high");
+    }
+
+    #[test]
+    fn review_lease_claim_next_body_rejects_invalid_optional_fields() {
+        let ttl_error = trace_commons_review_lease_claim_next_body(Some(0), None, None)
+            .expect_err("non-positive TTL is rejected");
+        assert!(ttl_error.to_string().contains("greater than 0"));
+
+        let due_at_error = trace_commons_review_lease_claim_next_body(
+            None,
+            Some("tomorrow-ish".to_string()),
+            None,
+        )
+        .expect_err("non-RFC3339 due timestamp is rejected");
+        assert!(due_at_error.to_string().contains("RFC3339"));
+    }
+
+    #[test]
+    fn review_lease_claim_batch_body_includes_optional_fields() {
+        let body = trace_commons_review_lease_claim_batch_body(
+            Some(5),
+            Some(900),
+            Some("2026-04-26T12:00:00Z".to_string()),
+            Some(TracePrivacyRiskArg::High),
+        )
+        .expect("body builds");
+
+        assert_eq!(body["limit"], 5);
+        assert_eq!(body["lease_ttl_seconds"], 900);
+        assert_eq!(body["review_due_at"], "2026-04-26T12:00:00Z");
+        assert_eq!(body["privacy_risk"], "high");
+    }
+
+    #[test]
+    fn review_lease_claim_batch_body_rejects_invalid_optional_fields() {
+        let limit_error = trace_commons_review_lease_claim_batch_body(Some(0), None, None, None)
+            .expect_err("zero limit is rejected");
+        assert!(limit_error.to_string().contains("greater than 0"));
+
+        let ttl_error = trace_commons_review_lease_claim_batch_body(Some(5), Some(0), None, None)
+            .expect_err("non-positive TTL is rejected");
+        assert!(ttl_error.to_string().contains("greater than 0"));
+
+        let due_at_error = trace_commons_review_lease_claim_batch_body(
+            Some(5),
+            None,
+            Some("tomorrow-ish".to_string()),
+            None,
+        )
+        .expect_err("non-RFC3339 due timestamp is rejected");
         assert!(due_at_error.to_string().contains("RFC3339"));
     }
 
@@ -7123,6 +7860,33 @@ mod tests {
     }
 
     #[test]
+    fn operational_summary_parses_through_cli() {
+        let cli = parse_cli([
+            "ironclaw",
+            "traces",
+            "operational-summary",
+            "--endpoint",
+            "https://trace.example/internal",
+            "--bearer-token-env",
+            "TRACE_COMMONS_ADMIN_TOKEN",
+            "--json",
+        ]);
+
+        let TracesCommand::OperationalSummary {
+            endpoint,
+            bearer_token_env,
+            json,
+        } = unwrap_traces_command(cli)
+        else {
+            panic!("expected traces operational-summary command");
+        };
+
+        assert_eq!(endpoint, "https://trace.example/internal");
+        assert_eq!(bearer_token_env, "TRACE_COMMONS_ADMIN_TOKEN");
+        assert!(json);
+    }
+
+    #[test]
     fn tenant_policy_set_parses_through_cli() {
         let cli = parse_cli([
             "ironclaw",
@@ -7187,6 +7951,163 @@ mod tests {
         .expect("url builds");
 
         assert_eq!(url, "https://trace.example/internal/v1/admin/config-status");
+    }
+
+    #[test]
+    fn operational_summary_uses_ingest_endpoint() {
+        let url = trace_commons_api_url(
+            "https://trace.example/internal/v1/traces",
+            "/v1/admin/operational-summary",
+            &[],
+        )
+        .expect("url builds");
+
+        assert_eq!(
+            url,
+            "https://trace.example/internal/v1/admin/operational-summary"
+        );
+    }
+
+    #[test]
+    fn operational_summary_lines_render_aggregate_counts_without_item_ids() {
+        let value = serde_json::json!({
+            "tenant_id": "tenant-a",
+            "tenant_storage_ref": "tenant:tenant-a",
+            "generated_at": "2026-04-28T10:00:00Z",
+            "submissions": {
+                "total": 2,
+                "accepted": 1,
+                "quarantined": 1,
+                "rejected": 0,
+                "revoked": 0,
+                "expired": 0,
+                "purged": 0,
+                "by_status": {
+                    "accepted": 1,
+                    "quarantined": 1
+                },
+                "by_privacy_risk": {
+                    "low": 1,
+                    "high": 1
+                },
+                "example_submission_ids": [
+                    "11111111-1111-1111-1111-111111111111"
+                ]
+            },
+            "review_sla": {
+                "quarantined_total": 1,
+                "fresh": 0,
+                "due": 0,
+                "overdue": 0,
+                "urgent": 1,
+                "assigned": 1,
+                "expired_leases": 0,
+                "oldest_age_hours": 36,
+                "by_state": {
+                    "urgent": 1
+                }
+            },
+            "exports": {
+                "db_available": true,
+                "manifest_count": 1,
+                "active_manifest_count": 1,
+                "invalidated_manifest_count": 0,
+                "deleted_manifest_count": 0,
+                "total_manifest_items": 1,
+                "job_count": 1,
+                "by_artifact_kind": {
+                    "replay_dataset": 1
+                },
+                "jobs_by_status": {
+                    "complete": 1
+                }
+            },
+            "retention": {
+                "db_available": true,
+                "job_count": 1,
+                "dry_run_count": 1,
+                "selected_revoked_total": 0,
+                "selected_expired_total": 1,
+                "jobs_by_status": {
+                    "dry_run": 1
+                }
+            },
+            "vectors": {
+                "db_available": true,
+                "entry_count": 1,
+                "active_entries": 1,
+                "invalidated_entries": 0,
+                "deleted_entries": 0,
+                "accepted_current_derived": 1,
+                "accepted_current_derived_with_active_vector": 1,
+                "active_coverage_percent": 100.0
+            },
+            "delayed_credit": {
+                "event_count": 1,
+                "points_positive": 0.25,
+                "points_negative": 0.0,
+                "points_total": 0.25,
+                "last_event_at": "2026-04-28T10:05:00Z",
+                "by_event_type": {
+                    "reviewer_bonus": 1
+                }
+            },
+            "promotion_gates": {
+                "ready": false,
+                "blocking_count": 1,
+                "warning_count": 1,
+                "blocking_gates": [
+                    "urgent_reviews=1"
+                ],
+                "warning_gates": [
+                    "tenant_rollout_gates=3"
+                ],
+                "db_mirror_configured": true,
+                "require_db_mirror_writes": true,
+                "require_db_reconciliation_clean": true,
+                "require_derived_export_object_refs": true,
+                "require_export_guardrails": true,
+                "object_primary_submit_review": false,
+                "object_primary_replay_export": true,
+                "object_primary_derived_exports": false,
+                "tenant_rollout_gate_count": 3,
+                "tenant_rollout_gate_counts": {
+                    "db_contributor_reads": 2,
+                    "object_primary": 1
+                },
+                "open_review_count": 1,
+                "urgent_review_count": 1,
+                "failed_export_job_count": 0,
+                "failed_retention_job_count": 0,
+                "vector_missing_count": 0
+            }
+        });
+
+        let lines = trace_commons_operational_summary_lines(&value);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("tenant: tenant-a"));
+        assert!(rendered.contains("submissions:"));
+        assert!(rendered.contains("totals: total=2 accepted=1 quarantined=1"));
+        assert!(rendered.contains("review sla:"));
+        assert!(rendered.contains("urgent=1"));
+        assert!(rendered.contains("export:"));
+        assert!(rendered.contains("by_artifact_kind: replay_dataset=1"));
+        assert!(rendered.contains("retention:"));
+        assert!(rendered.contains("vectors:"));
+        assert!(rendered.contains("active_coverage_percent=100.0"));
+        assert!(rendered.contains("delayed credit:"));
+        assert!(rendered.contains("by_event_type: reviewer_bonus=1"));
+        assert!(rendered.contains("promotion gates:"));
+        assert!(rendered.contains("ready=false"));
+        assert!(rendered.contains("blocking_count=1"));
+        assert!(rendered.contains("require_db_reconciliation_clean=true"));
+        assert!(rendered.contains("object_primary_replay_export=true"));
+        assert!(rendered.contains("tenant_rollout_gate_count=3"));
+        assert!(rendered.contains("blocking_gates: urgent_reviews=1"));
+        assert!(rendered.contains("warning_gates: tenant_rollout_gates=3"));
+        assert!(rendered.contains("tenant_rollout_gate_counts: db_contributor_reads=2"));
+        assert!(!rendered.contains("11111111-1111-1111-1111-111111111111"));
     }
 
     #[test]

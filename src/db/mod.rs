@@ -24,11 +24,6 @@ pub mod libsql;
 #[cfg(feature = "libsql")]
 pub mod libsql_migrations;
 
-mod trace_corpus_common;
-
-#[cfg(feature = "postgres")]
-mod trace_corpus_pg;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -1201,40 +1196,6 @@ pub trait IdentityStore: Send + Sync {
     ) -> Result<(), DatabaseError>;
 }
 
-/// Safe structural diagnostics for PostgreSQL Trace Commons RLS readiness.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TraceCorpusRlsDiagnostics {
-    pub expected_table_count: usize,
-    pub rls_enabled_count: usize,
-    pub force_rls_enabled_count: usize,
-    pub policy_installed_count: usize,
-    pub missing_policy_tables: Vec<String>,
-    pub rls_disabled_tables: Vec<String>,
-    pub force_rls_disabled_tables: Vec<String>,
-    pub policy_expression_mismatch_tables: Vec<String>,
-    pub current_role_bypasses_rls: bool,
-}
-
-impl TraceCorpusRlsDiagnostics {
-    pub fn rls_ready(&self) -> bool {
-        self.missing_policy_tables.is_empty()
-            && self.rls_disabled_tables.is_empty()
-            && self.policy_expression_mismatch_tables.is_empty()
-            && self.policy_installed_count == self.expected_table_count
-            && self.rls_enabled_count == self.expected_table_count
-            && !self.current_role_bypasses_rls
-    }
-
-    pub fn force_rls_ready(&self) -> bool {
-        self.force_rls_disabled_tables.is_empty()
-            && self.force_rls_enabled_count == self.expected_table_count
-    }
-
-    pub fn production_ready(&self) -> bool {
-        self.rls_ready() && self.force_rls_ready()
-    }
-}
-
 /// Backend-agnostic database supertrait.
 ///
 /// Combines all sub-traits into one. Existing `Arc<dyn Database>` consumers
@@ -1251,20 +1212,11 @@ pub trait Database:
     + UserStore
     + ChannelPairingStore
     + IdentityStore
-    + crate::trace_corpus_storage::TraceCorpusStore
     + Send
     + Sync
 {
     /// Run schema migrations for this backend.
     async fn run_migrations(&self) -> Result<(), DatabaseError>;
-
-    /// Return safe structural Trace Commons RLS diagnostics when the backend
-    /// can report them. Non-PostgreSQL backends return `None`.
-    async fn trace_corpus_rls_diagnostics(
-        &self,
-    ) -> Result<Option<TraceCorpusRlsDiagnostics>, DatabaseError> {
-        Ok(None)
-    }
 
     /// Rewrite all rows where user_id = 'default' to owner_id across all
     /// affected tables. Idempotent — safe to call on every startup.
